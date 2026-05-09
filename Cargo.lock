@@ -1466,8 +1466,8 @@ dependencies = [
 
 [[package]]
 name = "lash"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "async-trait",
  "base64",
@@ -1500,8 +1500,8 @@ dependencies = [
 
 [[package]]
 name = "lash-embed"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "async-trait",
  "lash",
@@ -1517,8 +1517,8 @@ dependencies = [
 
 [[package]]
 name = "lash-export"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "anyhow",
  "clap",
@@ -1532,8 +1532,8 @@ dependencies = [
 
 [[package]]
 name = "lash-llm-tools"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "async-trait",
  "jsonschema",
@@ -1544,8 +1544,8 @@ dependencies = [
 
 [[package]]
 name = "lash-mode-rlm"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "async-trait",
  "jsonschema",
@@ -1562,8 +1562,8 @@ dependencies = [
 
 [[package]]
 name = "lash-mode-standard"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "async-trait",
  "lash",
@@ -1583,24 +1583,22 @@ dependencies = [
  "lash-export",
  "lash-llm-tools",
  "lash-mode-rlm",
- "lash-provider-codex",
- "lash-provider-google",
- "lash-provider-openai",
  "lash-providers-builtin",
  "lash-rlm-types",
  "lash-sqlite-store",
  "lash-subagents",
+ "rand 0.9.4",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
- "tokio-util",
  "uuid",
 ]
 
 [[package]]
 name = "lash-openai-schema"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "lash-sansio",
  "serde",
@@ -1609,8 +1607,8 @@ dependencies = [
 
 [[package]]
 name = "lash-provider-anthropic"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "async-trait",
  "base64",
@@ -1623,8 +1621,8 @@ dependencies = [
 
 [[package]]
 name = "lash-provider-codex"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "async-trait",
  "base64",
@@ -1639,8 +1637,8 @@ dependencies = [
 
 [[package]]
 name = "lash-provider-google"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "async-trait",
  "base64",
@@ -1655,8 +1653,8 @@ dependencies = [
 
 [[package]]
 name = "lash-provider-openai"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "async-trait",
  "base64",
@@ -1670,8 +1668,8 @@ dependencies = [
 
 [[package]]
 name = "lash-providers-builtin"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "lash-provider-anthropic",
  "lash-provider-codex",
@@ -1681,8 +1679,8 @@ dependencies = [
 
 [[package]]
 name = "lash-rlm-types"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "lash-sansio",
  "serde",
@@ -1691,8 +1689,8 @@ dependencies = [
 
 [[package]]
 name = "lash-sansio"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "schemars",
  "serde",
@@ -1702,8 +1700,8 @@ dependencies = [
 
 [[package]]
 name = "lash-sqlite-store"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "async-trait",
  "flate2",
@@ -1718,8 +1716,8 @@ dependencies = [
 
 [[package]]
 name = "lash-subagents"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "async-trait",
  "lash",
@@ -1735,8 +1733,8 @@ dependencies = [
 
 [[package]]
 name = "lash-trace"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "chrono",
  "serde",
@@ -1748,8 +1746,8 @@ dependencies = [
 
 [[package]]
 name = "lashlang"
-version = "0.2.101"
-source = "git+https://github.com/SamGalanakis/lash?rev=ab6b6f31f98669ce495a1338182955d3902e629a#ab6b6f31f98669ce495a1338182955d3902e629a"
+version = "0.2.109"
+source = "git+https://github.com/SamGalanakis/lash?rev=8019c0581b137020844dd7d54a56d4aea1072209#8019c0581b137020844dd7d54a56d4aea1072209"
 dependencies = [
  "compact_str",
  "futures-executor",

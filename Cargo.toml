@@ -13,21 +13,19 @@ anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
+rand = "0.9"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
 
-lash = { git = "https://github.com/SamGalanakis/lash", rev = "ab6b6f31f98669ce495a1338182955d3902e629a", default-features = false, features = ["full"] }
-lash-embed = { git = "https://github.com/SamGalanakis/lash", rev = "ab6b6f31f98669ce495a1338182955d3902e629a" }
-lash-export = { git = "https://github.com/SamGalanakis/lash", rev = "ab6b6f31f98669ce495a1338182955d3902e629a" }
-lash-llm-tools = { git = "https://github.com/SamGalanakis/lash", rev = "ab6b6f31f98669ce495a1338182955d3902e629a" }
-lash-mode-rlm = { git = "https://github.com/SamGalanakis/lash", rev = "ab6b6f31f98669ce495a1338182955d3902e629a" }
-lash-provider-codex = { git = "https://github.com/SamGalanakis/lash", rev = "ab6b6f31f98669ce495a1338182955d3902e629a" }
-lash-provider-google = { git = "https://github.com/SamGalanakis/lash", rev = "ab6b6f31f98669ce495a1338182955d3902e629a" }
-lash-provider-openai = { git = "https://github.com/SamGalanakis/lash", rev = "ab6b6f31f98669ce495a1338182955d3902e629a" }
-lash-providers-builtin = { git = "https://github.com/SamGalanakis/lash", rev = "ab6b6f31f98669ce495a1338182955d3902e629a" }
-lash-rlm-types = { git = "https://github.com/SamGalanakis/lash", rev = "ab6b6f31f98669ce495a1338182955d3902e629a" }
-lash-sqlite-store = { git = "https://github.com/SamGalanakis/lash", rev = "ab6b6f31f98669ce495a1338182955d3902e629a" }
-lash-subagents = { git = "https://github.com/SamGalanakis/lash", rev = "ab6b6f31f98669ce495a1338182955d3902e629a" }
+lash = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209", default-features = false, features = ["full"] }
+lash-embed = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
+lash-export = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
+lash-llm-tools = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
+lash-mode-rlm = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
+lash-providers-builtin = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
+lash-rlm-types = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
+lash-sqlite-store = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
+lash-subagents = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
