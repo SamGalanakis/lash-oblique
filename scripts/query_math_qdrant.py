@@ -68,7 +68,7 @@ def hits(points):
                 "rank": rank,
                 "doc_id": payload.get("doc_id") or str(point.id),
                 "score": point.score,
-                "text_preview": (payload.get("text") or "")[:500],
+                "text": payload.get("text") or "",
                 "metadata": payload.get("metadata") or {},
             }
         )

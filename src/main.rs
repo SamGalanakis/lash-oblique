@@ -855,10 +855,10 @@ fn run_prompt(
             excluded.iter().cloned().collect::<Vec<_>>().join(", ")
         )
     };
-    let late_tool_line = if late_available {
-        "- `late_search(query, candidate_pool=1500, limit=200)`: late-interaction reranking; single-channel diversity probe.\n"
+    let modes_clause = if late_available {
+        "\"hybrid\" | \"bm25\" | \"dense\" | \"late\""
     } else {
-        ""
+        "\"hybrid\" | \"bm25\" | \"dense\""
     };
     format!(
         r#"You are running one query from a retrieval benchmark.
@@ -883,18 +883,15 @@ The searchable corpus has {corpus_docs} documents. Every submitted id must come 
 - **schema-anchored query** — a phrasing of the schema that deliberately avoids the original surface vocabulary, so it can match documents whose surface features are different but whose structural relations are the same.
 
 # Tool surface
-- `hybrid_search(queries: [str], limit=300, candidate_pool=1500)`: BM25 + dense fused via RRF. Best broad candidate generator. Pass 4–6 probes per call.
-- `bm25_search(query, limit=200)`: lexical only. Single-channel diversity probe.
-- `dense_search(query, limit=200)`: dense only. Single-channel diversity probe.
-- `discover_docs(target_query, context_pairs=[{{positive_doc_id, negative_doc_id}}], limit=300)`: example-anchored dense search. Use after Phase B' once you have schema-sharing positives AND named surface-similar distractors as negatives.
-{late_tool_line}- `fetch_docs(doc_ids, up to 50)`: read full text. Required in Phase B'.
+- `search(queries: [str], mode: {modes_clause} = "hybrid", limit=300, candidate_pool=1500)`: corpus retrieval. `hybrid` (default) does BM25 + dense (and late, if available) fused via RRF over all `queries` — pass 4–6 probes per call. Single-channel modes (`bm25` / `dense` / `late`) take only `queries[0]`. Returns `{{matches: [...]}}` with `rank`, `doc_id`, `score`, **`text` (full text inline)**, `metadata`. Read top entries directly from the result — there is no separate fetch step.
+- `discover_docs(target_query, context_pairs=[{{positive_doc_id, negative_doc_id}}], limit=300)`: example-anchored dense search. Use once you have schema-sharing positives AND named surface-similar distractors as negatives. Returns the same shape as `search`.
 - `spawn_agent(...)`: full RLM session with the same tools; for parallel scout lines, each in a different surface domain.
-- `llm_query(task, inputs, output)`: ONE direct LLM call against text you supply. CAN return structured JSON, extract many fields per doc, judge a batch of 30–50 docs in one shot. CANNOT search, fetch, or call tools.
-- `tournament_rerank(query, candidate_doc_ids, top_k=100)`: listwise reranker. **Internally caps input at 300 — DO NOT pass more, the tail is dropped silently. Pass your top 300 by RRF rank.**
+- `llm_query(task, inputs, output)`: ONE direct LLM call against text you supply. CAN return structured JSON, judge a batch of 30–50 doc texts in one shot. CANNOT search or call tools.
+- `tournament_rerank(query, candidate_pools=[{{label, ranked_doc_ids}}], top_k=100)`: listwise reranker. Takes labeled candidate pools (one per channel/probe-set you ran), does canonical RRF (k=60) across them to produce the top 300, then runs the listwise tournament. Pass each search result set as its own pool — the merge is deterministic and won't drop single-channel hits.
 
 # Effort routing
 - Think → main loop (free).
-- Read → `fetch_docs` + main-loop reasoning.
+- Read → main-loop reasoning over the `text` field of search results (already inline).
 - Look-at-text-and-judge → `llm_query`, batched.
 - Run-its-own-search-loop → `spawn_agent`, in parallel.
 - Rank → `tournament_rerank`. Submission must come from its output.
@@ -908,16 +905,16 @@ The searchable corpus has {corpus_docs} documents. Every submitted id must come 
 2. Write 4–6 SURFACE probes — paraphrases of the query in its own surface vocabulary. These exercise Tier 1.
 
 ## Phase B — Tier 1 cheap surface retrieval (1 call)
-3. `hybrid_search(queries = your 4–6 surface probes, limit=300, candidate_pool=1500)`.
+3. `search(queries = your 4–6 surface probes, mode="hybrid", limit=300, candidate_pool=1500)`.
 
 ## Phase B' — audit (the load-bearing step; never skip)
-4. `fetch_docs(doc_ids = top 8 of Phase B output)`.
+4. Read the **top 8 entries** from your Phase B `search` output directly — `text` is inline, no fetch needed.
 5. In the main loop, for each of the top 8 candidates, classify and label:
    - (i) **shares the schema** — name in one phrase the structural correspondence (which objects, which relations).
    - (ii) **surface-similar distractor** — name the surface tokens that fooled the search (these are what schema-anchored probes must AVOID).
    - (iii) **unclear** — count as a non-hit for the decision below.
 6. Decide:
-   - **≥ 5 of top 8 are (i)** → Tier 1 was sufficient. Skip to Phase D using the Phase B pool's top 300.
+   - **≥ 5 of top 8 are (i)** → Tier 1 was sufficient. Skip to Phase D with just the Phase B pool.
    - **Otherwise** → Phase C (Tier 2).
 
 ## Phase C — Tier 2 schema-anchored widening (escalation)
@@ -925,34 +922,33 @@ The searchable corpus has {corpus_docs} documents. Every submitted id must come 
    - Each phrases the schema as a complete-sentence query.
    - Each uses surface vocabulary from a DIFFERENT surface domain than the query's.
    - Each AVOIDS the distractor tokens you flagged in step 5.
-8. `hybrid_search(queries = your 4–6 schema-anchored probes, limit=300, candidate_pool=1500)`.
+8. `search(queries = your 4–6 schema-anchored probes, mode="hybrid", limit=300, candidate_pool=1500)`.
 9. If you have ≥ 1 schema-sharing positive AND ≥ 1 named distractor from Phase B', also run:
    `discover_docs(target_query = your best schema-anchored phrasing, context_pairs = 4–10 (positive, distractor) pairs, limit=300)`.
 10. **Optional Tier 3** — only if step 8/9 is still thin or still surface-y when spot-checked:
     - `spawn_agent` × 2–4 in parallel, each with a distinct schema-anchored brief in a different surface domain.
-    - One `bm25_search` and/or `dense_search` (limit=200) on a schema-anchored phrasing not yet covered.
-11. Merge results from all channels (B + C steps). Take the **top 300 by RRF rank** across channels. This is the input to Phase D.
+    - `search(queries = [one schema-anchored phrasing not yet covered], mode="bm25" | "dense" | "late", limit=200)` for a single-channel diversity probe.
 
 ## Phase D — rerank (mandatory)
-12. `tournament_rerank(query = the original query, optionally appended with a one-line schema description from step 1, candidate_doc_ids = your top-300 RRF-ranked merged pool, top_k=100)`.
+11. Build `candidate_pools` — one entry PER search result set you ran (Phase B + every Phase C call + each spawn_agent's returned ids). Each entry is `{{ "label": "<your label>", "ranked_doc_ids": <that call's matches as ids in order> }}`. **Don't pre-merge. Don't truncate. Don't drop single-channel pools.** Tournament does the RRF merge across pools and caps at 300 internally.
+12. `tournament_rerank(query = the original query (optionally appended with a one-line schema description from step 1), candidate_pools = <your labeled pools from step 11>, top_k=100)`.
 
 ## Submission
 The output of step 12 is your submission, in order. Do not hand-reorder.
 
 # Pool sizing summary
-- hybrid_search:     limit 300, candidate_pool 1500, 4–6 probes/call
-- bm25/dense:        limit 200, single-channel diversity only
+- search hybrid:     limit 300, candidate_pool 1500, 4–6 probes/call
+- search single:     limit 200, single channel diversity only (one query)
 - discover_docs:     limit 300, 4–10 (positive, distractor) pairs
-- fetch_docs:        top 8 in Phase B' is mandatory; up to 50/call
 - spawn_agent:       2–4 in parallel, each ~150 ids
-- tournament_rerank: input ≤ 300 (HARD CAP, enforced internally), top_k 100
+- tournament_rerank: any number of pools; internal RRF + cap to top 300; output top_k 100
 - llm_query batches: 30–50 items/call
 
 # Hard rules
 - Every submitted id comes from a tool result.
 - Submission = `tournament_rerank` output. No hand-ordering, no skipping the rerank.
-- Submit exactly 100 unique, non-excluded ids. If `tournament_rerank` returns fewer than 100 (because your input pool was small), fill the tail with the next-best candidates from your merged pool by RRF rank.
-- `tournament_rerank` input MUST be your top 300 by RRF — passing more wastes time because the tail is dropped silently.
+- Submit exactly 100 unique, non-excluded ids. If `tournament_rerank` returns fewer than 100, fill the tail with the next-best candidates from your raw pools (in any reasonable order).
+- For `tournament_rerank`, pass each search/discover/spawn result as its own pool. Tournament's RRF merge is deterministic and won't drop single-channel hits — agent-side pre-merging is what causes recall regressions.
 
 # Submission
 ```lashlang
@@ -964,7 +960,7 @@ submit {{ ranked_doc_ids: [/* exactly 100 strings */] }}
         excluded_text = excluded_text,
         query_text = query.text,
         corpus_docs = stats.corpus_docs,
-        late_tool_line = late_tool_line,
+        modes_clause = modes_clause,
     )
 }
 
@@ -1013,53 +1009,61 @@ struct ObliqTools {
 #[async_trait]
 impl ToolProvider for ObliqTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        let hybrid_description = if self.late_available {
-            "Run hybrid retrieval for several probes, combining lexical and dense evidence with late-interaction evidence. This is usually the best broad candidate generator. Returns `{ matches: [...] }` ordered best-first by fused relevance; each match has `rank`, `doc_id`, `score`, `text_preview`, and `metadata`. Default `limit` is 100."
+        let modes_clause = if self.late_available {
+            "\"hybrid\" | \"bm25\" | \"dense\" | \"late\""
         } else {
-            "Run hybrid retrieval for several probes, combining lexical and dense evidence. This is usually the best broad candidate generator. Returns `{ matches: [...] }` ordered best-first by fused relevance; each match has `rank`, `doc_id`, `score`, `text_preview`, and `metadata`. Default `limit` is 100."
+            "\"hybrid\" | \"bm25\" | \"dense\""
         };
-        let mut tools = vec![
+        let search_description = format!(
+            "Search the OBLIQ corpus. `mode` selects the retrieval channel: {modes_clause}. \
+             `hybrid` (default) does BM25+dense (and late, if available) fused via RRF over \
+             all `queries` — pass 4–6 probes per call. Single-channel modes (`bm25` / \
+             `dense` / `late`) take only `queries[0]`. Returns `{{ matches: [...] }}` \
+             ordered best-first; each match has `rank`, `doc_id`, `score`, `text` (full \
+             text inline), and `metadata`. Read top-N entries directly from the result — \
+             no separate fetch step needed."
+        );
+        let mode_enum: Vec<Value> = if self.late_available {
+            vec![json!("hybrid"), json!("bm25"), json!("dense"), json!("late")]
+        } else {
+            vec![json!("hybrid"), json!("bm25"), json!("dense")]
+        };
+        vec![
             obliq_tool(
-                "fetch_docs",
-                "Fetch OBLIQ corpus documents by document id.",
+                "search",
+                &search_description,
                 json!({
                     "type": "object",
                     "properties": {
-                        "doc_ids": {
+                        "queries": {
                             "type": "array",
-                            "items": { "type": "string" },
+                            "items": { "type": "string", "minLength": 1 },
                             "minItems": 1,
-                            "maxItems": 100
-                        }
+                            "maxItems": 12
+                        },
+                        "mode": { "type": "string", "enum": mode_enum, "default": "hybrid" },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 },
+                        "candidate_pool": { "type": "integer", "minimum": 1, "maximum": 2000, "default": 1000 }
                     },
-                    "required": ["doc_ids"],
+                    "required": ["queries"],
                     "additionalProperties": false
                 }),
-            ),
-            obliq_tool(
-                "bm25_search",
-                "Search the OBLIQ corpus with lexical BM25 retrieval. Returns `{ matches: [...] }` ordered best-first by BM25 relevance; each match has `rank`, `doc_id`, `score`, `text_preview`, and `metadata`. Default `limit` is 100.",
-                search_schema(),
-            ),
-            obliq_tool(
-                "dense_search",
-                "Search the OBLIQ corpus with dense semantic retrieval. Returns `{ matches: [...] }` ordered best-first by dense relevance; each match has `rank`, `doc_id`, `score`, `text_preview`, and `metadata`. Default `limit` is 100.",
-                search_schema(),
+                search_response_schema(),
             ),
             obliq_tool(
                 "discover_docs",
-                "Use example-guided discovery: provide a target query plus positive-vs-negative document pairs to guide retrieval toward the latent pattern you want and away from false friends. Use this after `fetch_docs` when you can identify examples of matching and non-matching relevance patterns. Returns `{ matches: [...] }` ordered best-first; each match has `rank`, `doc_id`, `score`, `text_preview`, and `metadata`. Default `limit` is 100.",
+                "Example-guided discovery: provide a target query plus positive-vs-negative document pairs to bias retrieval toward the latent pattern you want and away from surface-similar distractors. Returns `{ matches: [...] }` ordered best-first; each match has `rank`, `doc_id`, `score`, `text`, and `metadata`.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "target_query": { "type": "string" },
+                        "target_query": { "type": "string", "minLength": 1 },
                         "context_pairs": {
                             "type": "array",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "positive_doc_id": { "type": "string" },
-                                    "negative_doc_id": { "type": "string" }
+                                    "positive_doc_id": { "type": "string", "minLength": 1 },
+                                    "negative_doc_id": { "type": "string", "minLength": 1 }
                                 },
                                 "required": ["positive_doc_id", "negative_doc_id"],
                                 "additionalProperties": false
@@ -1072,48 +1076,17 @@ impl ToolProvider for ObliqTools {
                     "required": ["target_query", "context_pairs"],
                     "additionalProperties": false
                 }),
+                search_response_schema(),
             ),
-            obliq_tool(
-                "hybrid_search",
-                hybrid_description,
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "queries": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "minItems": 1,
-                            "maxItems": 12
-                        },
-                        "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 },
-                        "candidate_pool": { "type": "integer", "minimum": 1, "maximum": 2000, "default": 1000 }
-                    },
-                    "required": ["queries"],
-                    "additionalProperties": false
-                }),
-            ),
-        ];
-        if self.late_available {
-            tools.push(obliq_tool(
-                "late_search",
-                "Search the OBLIQ corpus with late-interaction reranking. Returns `{ matches: [...] }` ordered best-first by late-interaction score. Default `limit` is 100.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string" },
-                        "candidate_pool": { "type": "integer", "minimum": 1, "maximum": 2000, "default": 1000 },
-                        "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 }
-                    },
-                    "required": ["query"],
-                    "additionalProperties": false
-                }),
-            ));
-        }
-        tools
+        ]
     }
 
     async fn execute(&self, name: &str, args: &Value) -> ToolResult {
-        match self.call_script(name, args).await {
+        let result = match name {
+            "search" => self.dispatch_search(args).await,
+            other => self.call_script(other, args).await,
+        };
+        match result {
             Ok(value) => ToolResult::ok(value),
             Err(error) => ToolResult::err_fmt(error),
         }
@@ -1121,6 +1094,52 @@ impl ToolProvider for ObliqTools {
 }
 
 impl ObliqTools {
+    async fn dispatch_search(&self, args: &Value) -> anyhow::Result<Value> {
+        let mode = args
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("hybrid");
+        let queries = args
+            .get("queries")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("search needs `queries: [str]`"))?;
+        if queries.is_empty() {
+            bail!("search needs at least one query");
+        }
+        let limit = args.get("limit").cloned();
+        let candidate_pool = args.get("candidate_pool").cloned();
+        let (op, payload) = match mode {
+            "hybrid" => {
+                let mut p = json!({ "queries": queries });
+                if let Some(v) = limit { p["limit"] = v; }
+                if let Some(v) = candidate_pool { p["candidate_pool"] = v; }
+                ("hybrid_search", p)
+            }
+            "bm25" | "dense" => {
+                let q = queries[0].as_str().unwrap_or_default();
+                let mut p = json!({ "query": q });
+                if let Some(v) = limit { p["limit"] = v; }
+                if mode == "bm25" {
+                    ("bm25_search", p)
+                } else {
+                    ("dense_search", p)
+                }
+            }
+            "late" => {
+                if !self.late_available {
+                    bail!("search mode `late` is not available on this collection");
+                }
+                let q = queries[0].as_str().unwrap_or_default();
+                let mut p = json!({ "query": q });
+                if let Some(v) = limit { p["limit"] = v; }
+                if let Some(v) = candidate_pool { p["candidate_pool"] = v; }
+                ("late_search", p)
+            }
+            other => bail!("unknown search mode: {other}"),
+        };
+        self.call_script(op, &payload).await
+    }
+
     pub async fn fetch_doc_texts(
         &self,
         doc_ids: &[String],
@@ -1300,24 +1319,42 @@ fn rerank_items(items: &mut [Value]) {
     }
 }
 
-fn obliq_tool(name: &str, description: &str, input_schema: Value) -> ToolDefinition {
-    ToolDefinition::new(
-        name,
-        description,
-        input_schema,
-        json!({ "type": "object", "additionalProperties": true }),
-    )
-    .with_execution_mode(ToolExecutionMode::Parallel)
+fn obliq_tool(
+    name: &str,
+    description: &str,
+    input_schema: Value,
+    output_schema: Value,
+) -> ToolDefinition {
+    ToolDefinition::new(name, description, input_schema, output_schema)
+        .with_execution_mode(ToolExecutionMode::Parallel)
 }
 
-fn search_schema() -> Value {
+fn search_match_item_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "query": { "type": "string" },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 }
+            "rank": { "type": "integer", "minimum": 1 },
+            "doc_id": { "type": "string" },
+            "score": { "type": "number" },
+            "text": { "type": "string" },
+            "metadata": { "type": "object", "additionalProperties": true }
         },
-        "required": ["query"],
+        "required": ["rank", "doc_id", "score", "text", "metadata"],
+        "additionalProperties": false
+    })
+}
+
+fn search_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "matches": {
+                "type": "array",
+                "items": search_match_item_schema()
+            },
+            "excluded_doc_ids_hidden": { "type": "integer", "minimum": 0 }
+        },
+        "required": ["matches"],
         "additionalProperties": false
     })
 }
@@ -1345,11 +1382,12 @@ fn list_async_handles_tool_definition() -> ToolDefinition {
         json!({
             "type": "object",
             "properties": {
-                "monitor": { "type": "object" },
-                "subagent": { "type": "object" },
-                "tool": { "type": "object" }
+                "monitor": { "type": "object", "additionalProperties": true },
+                "subagent": { "type": "object", "additionalProperties": true },
+                "tool": { "type": "object", "additionalProperties": true }
             },
-            "required": ["monitor", "subagent", "tool"]
+            "required": ["monitor", "subagent", "tool"],
+            "additionalProperties": false
         }),
     )
     .with_execution_mode(ToolExecutionMode::Parallel)
