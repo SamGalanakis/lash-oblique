@@ -8,6 +8,10 @@ exactly 100 ranked corpus document IDs.
 
 ## Setup
 
+Requires [`uv`](https://docs.astral.sh/uv/) on PATH. The Python scripts use PEP 723
+inline metadata, so `uv` resolves and caches their dependencies automatically on
+first invocation — no `requirements.txt`, no virtualenv to manage.
+
 Start Qdrant in one terminal:
 
 ```bash
@@ -33,18 +37,17 @@ The runner uses the active provider from `~/.lash/config.json`. Override it with
 
 ## Tool Surface
 
-The RLM gets:
+The RLM gets six tools:
 
-- `fetch_docs`
-- `bm25_search`
-- `dense_search`
-- `late_search`
-- `discover_docs`
-- `hybrid_search`
-- `llm_query`
-- `continue_as`
-- `list_async_handles`
-- `spawn_agent`
+- `search(queries, mode, limit, candidate_pool)` — corpus retrieval; `mode` is
+  `"hybrid"` (default, BM25 + dense + optional late fused via RRF), `"bm25"`,
+  `"dense"`, or `"late"`.
+- `discover_docs(target_query, context_pairs, limit)` — example-anchored search
+  using positive/negative document pairs.
+- `tournament_rerank(query, candidate_pools, top_k)` — listwise tournament
+  reranker; takes labeled candidate pools, does canonical RRF (k=60) across
+  them, caps at 300, then runs the tournament.
+- `llm_query`, `spawn_agent`, `list_async_handles` — RLM utilities.
 
 The Qdrant collection stores:
 
@@ -54,10 +57,10 @@ The Qdrant collection stores:
 
 The setup script loads `OPENROUTER_API_KEY` from `/home/sam/code/lash/.env` by default.
 
-All ranked retrieval tools return `{ "matches": [...] }` ordered best-first. Each
-match includes `rank`, `doc_id`, `score`, `text_preview`, and `metadata`.
-Search tools default to `limit: 100` and cap at 200. `hybrid_search` uses
-Qdrant server-side RRF fusion over BM25 and dense prefetches, plus late
+All ranked retrieval tools return `{ "matches": [...] }` ordered best-first.
+Each match includes `rank`, `doc_id`, `score`, `text` (full text inline), and
+`metadata`. Search tools default to `limit: 100` and cap at 200. Hybrid mode
+uses Qdrant server-side RRF fusion over BM25 and dense prefetches, plus late
 prefetches when the collection was built with `--enable-late`.
 
 ## Evaluate A Saved Submission

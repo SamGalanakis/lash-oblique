@@ -1,4 +1,12 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "qdrant-client[fastembed]>=1.14",
+#   "fastembed>=0.6",
+#   "requests>=2.32",
+# ]
+# ///
 import argparse
 import json
 import os

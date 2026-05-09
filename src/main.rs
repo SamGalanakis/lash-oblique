@@ -342,7 +342,6 @@ async fn run_one_math_query(
     );
     let tools = Arc::new(ObliqTools {
         script: PathBuf::from("scripts/query_math_qdrant.py"),
-        python: python_bin(),
         data_dir,
         qdrant_url,
         collection,
@@ -998,7 +997,6 @@ fn parse_submission(value: Value) -> anyhow::Result<RankedSubmission> {
 #[derive(Clone)]
 struct ObliqTools {
     script: PathBuf,
-    python: PathBuf,
     data_dir: PathBuf,
     qdrant_url: String,
     collection: String,
@@ -1184,8 +1182,7 @@ impl ObliqTools {
     }
 
     async fn call_script_raw(&self, op: &str, args: &Value) -> anyhow::Result<Value> {
-        let mut child = tokio::process::Command::new(&self.python)
-            .arg(&self.script)
+        let mut child = tokio::process::Command::new(&self.script)
             .arg("--op")
             .arg(op)
             .arg("--data-dir")
@@ -1404,18 +1401,6 @@ fn resolve_provider(provider_id: Option<&str>) -> anyhow::Result<lash::ProviderH
             .map_err(anyhow::Error::msg)?;
     }
     config.build_active_provider().map_err(anyhow::Error::msg)
-}
-
-fn python_bin() -> PathBuf {
-    if let Some(value) = std::env::var_os("OBLIQ_PYTHON") {
-        return PathBuf::from(value);
-    }
-    let venv = PathBuf::from(".venv/bin/python");
-    if venv.exists() {
-        venv
-    } else {
-        PathBuf::from("python3")
-    }
 }
 
 fn lash_home() -> PathBuf {
