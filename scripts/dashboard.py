@@ -7,9 +7,9 @@
 
 Reads:
   <run_dir>/_manifest.json        run config (model, variant, description, hashes)
-  <run_dir>/_batch_summary.json   aggregate metrics + per-query rollup
-  <run_dir>/<query_id>.json       per-query results
-  <run_dir>/<query_id>.trace.jsonl optional, for token-usage / cost roll-up
+  <run_dir>/_batch_summary.json   aggregate metrics + per-task rollup
+  <run_dir>/<subset>/<task_id>.json per-task results
+  <run_dir>/<subset>/<task_id>.trace.jsonl optional, for token/cost roll-up
 
 Writes:
   <run_dir>/dashboard.html        single self-contained file
@@ -321,7 +321,7 @@ footer a:hover {{ color: var(--chalk); border-bottom-color: var(--sodium); }}
     <span class="meta-row"><span class="meta-key">model</span><span class="meta-val">{model}/{variant}</span></span>
     <span class="meta-row"><span class="meta-key">config</span><span class="meta-val hash" title="{config_hash} (click to copy)" data-copy="{config_hash}">{config_hash}</span></span>
     <span class="meta-row"><span class="meta-key">agent</span><span class="meta-val hash" title="{agent_hash} (click to copy)" data-copy="{agent_hash}">{agent_hash}</span></span>
-    <span class="meta-row"><span class="meta-key">queries</span><span class="meta-val">{n_total}</span></span>
+    <span class="meta-row"><span class="meta-key">tasks</span><span class="meta-val">{n_total}</span></span>
     <span class="meta-row"><span class="meta-key">scored</span><span class="meta-val">{n_scored}</span></span>
     <span class="meta-row"><span class="meta-key">failed</span><span class="meta-val{failed_class}">{n_failed}</span></span>
     <span class="meta-row"><span class="meta-key">when</span><span class="meta-val">{run_when}</span></span>
@@ -353,14 +353,15 @@ footer a:hover {{ color: var(--chalk); border-bottom-color: var(--sodium); }}
   {failed_section}
 
   <section>
-    <h2>per-query results</h2>
+    <h2>per-task results</h2>
     <div class="toolbar">
-      <input id="q" type="search" placeholder="filter query_id…" autocomplete="off" spellcheck="false">
+      <input id="q" type="search" placeholder="filter task…" autocomplete="off" spellcheck="false">
       <span id="qmeta"></span>
     </div>
     <table id="results">
       <thead><tr>
-        <th data-sort="qid">query_id</th>
+        <th data-sort="subset">subset</th>
+        <th data-sort="qid">task_id</th>
         <th data-sort="num" data-key="ndcg10" title="P / G">NDCG@10</th>
         <th data-sort="num" data-key="ndcg50" title="P / G">NDCG@50</th>
         <th data-sort="num" data-key="r10" title="P / G">R@10</th>
@@ -395,7 +396,9 @@ footer a:hover {{ color: var(--chalk); border-bottom-color: var(--sodium); }}
     let visible = 0;
     for (const row of rows) {{
       const qid = row.dataset.qid || '';
-      const show = !q || qid.toLowerCase().includes(q);
+      const subset = row.dataset.subset || '';
+      const task = row.dataset.task || '';
+      const show = !q || qid.toLowerCase().includes(q) || subset.toLowerCase().includes(q) || task.toLowerCase().includes(q);
       row.style.display = show ? '' : 'none';
       if (show) visible++;
     }}
@@ -406,6 +409,7 @@ footer a:hover {{ color: var(--chalk); border-bottom-color: var(--sodium); }}
     const key = sortKey, dir = sortDir;
     const sign = dir === 'asc' ? 1 : -1;
     const sorted = rows.slice().sort((a, b) => {{
+      if (key === 'subset') return sign * a.dataset.subset.localeCompare(b.dataset.subset);
       if (key === 'qid') return sign * a.dataset.qid.localeCompare(b.dataset.qid);
       const av = parseFloat(a.dataset[key] || '0') || 0;
       const bv = parseFloat(b.dataset[key] || '0') || 0;
@@ -414,7 +418,7 @@ footer a:hover {{ color: var(--chalk); border-bottom-color: var(--sodium); }}
     sorted.forEach((r) => tbody.appendChild(r));
     ths.forEach((th) => {{
       th.classList.remove('sorted', 'sorted-asc');
-      if (th.dataset.key === key || (key === 'qid' && th.dataset.sort === 'qid')) {{
+      if (th.dataset.key === key || (key === 'qid' && th.dataset.sort === 'qid') || (key === 'subset' && th.dataset.sort === 'subset')) {{
         th.classList.add('sorted');
         if (dir === 'asc') th.classList.add('sorted-asc');
       }}
@@ -423,10 +427,10 @@ footer a:hover {{ color: var(--chalk); border-bottom-color: var(--sodium); }}
 
   ths.forEach((th) => {{
     th.addEventListener('click', () => {{
-      const key = th.dataset.key || (th.dataset.sort === 'qid' ? 'qid' : null);
+      const key = th.dataset.key || (th.dataset.sort === 'qid' ? 'qid' : th.dataset.sort === 'subset' ? 'subset' : null);
       if (!key) return;
       if (sortKey === key) sortDir = sortDir === 'desc' ? 'asc' : 'desc';
-      else {{ sortKey = key; sortDir = key === 'qid' ? 'asc' : 'desc'; }}
+      else {{ sortKey = key; sortDir = key === 'qid' || key === 'subset' ? 'asc' : 'desc'; }}
       applySort();
     }});
   }});
@@ -498,6 +502,30 @@ def std(xs: list[float]) -> float:
     return (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5
 
 
+def entry_subset(entry: dict) -> str:
+    return str(entry.get("subset") or "")
+
+
+def entry_task_id(entry: dict) -> str:
+    return str(entry.get("task_id") or entry.get("query_id") or "?")
+
+
+def entry_task_label(entry: dict) -> str:
+    subset = entry_subset(entry)
+    task_id = entry_task_id(entry)
+    return f"{subset}/{task_id}" if subset else task_id
+
+
+def artifact_relpath(entry: dict, suffix: str) -> pathlib.Path | None:
+    task_id = entry_task_id(entry)
+    if not task_id or task_id == "?":
+        return None
+    subset = entry_subset(entry)
+    if subset:
+        return pathlib.Path(subset) / f"{task_id}{suffix}"
+    return pathlib.Path(f"{task_id}{suffix}")
+
+
 def render_histogram(values: list[float], bins: int | None = None) -> str:
     """Render an SVG-free flexbox histogram. Empty bins render as a 1px floor.
 
@@ -517,7 +545,7 @@ def render_histogram(values: list[float], bins: int | None = None) -> str:
     peak = max(counts) or 1
     bars = []
     for i, c in enumerate(counts):
-        title = f"{i/bins:.2f}–{(i+1)/bins:.2f}: {c} queries"
+        title = f"{i/bins:.2f}–{(i+1)/bins:.2f}: {c} tasks"
         if c == 0:
             bars.append(f'<div class="hist-bar empty" title="{title}"></div>')
             continue
@@ -532,7 +560,9 @@ def render_histogram(values: list[float], bins: int | None = None) -> str:
 def render_table_rows(per_query: list[dict]) -> str:
     rows = []
     for entry in per_query:
-        qid = entry.get("query_id", "?")
+        subset = entry_subset(entry)
+        task_id = entry_task_id(entry)
+        label = entry_task_label(entry)
         ok = bool(entry.get("ok"))
         m = entry.get("metrics") or {}
         g = m.get("gold") or {}
@@ -563,19 +593,21 @@ def render_table_rows(per_query: list[dict]) -> str:
             )
 
         if trace_html:
-            qid_cell = f'<a href="{escape(trace_html)}">{escape(qid)}</a>'
+            task_cell = f'<a href="{escape(trace_html)}">{escape(task_id)}</a>'
             qid_extra = ""
         else:
-            qid_cell = escape(qid)
+            task_cell = escape(task_id)
             qid_extra = " qid-untraced"
         tr_class_attr = '' if ok else ' class="row-status-failed"'
         rows.append(
             f'<tr{tr_class_attr} '
-            f'data-qid="{escape(qid)}" '
+            f'data-subset="{escape(subset)}" data-task="{escape(task_id)}" '
+            f'data-qid="{escape(label)}" '
             f'data-ndcg10="{ndcg10:.6f}" data-ndcg50="{ndcg50:.6f}" '
             f'data-r10="{r10:.6f}" data-r50="{r50:.6f}" data-r100="{r100:.6f}" '
             f'data-tools="{tools}" data-cost="{cost:.6f}" data-reason="{reason}">'
-            f'<td class="qid{qid_extra}">{qid_cell}</td>'
+            f'<td>{escape(subset or "-")}</td>'
+            f'<td class="qid{qid_extra}">{task_cell}</td>'
             f'{cell(ndcg10, g_ndcg10)}'
             f'{cell(ndcg50, g_ndcg50)}'
             f'{cell(r10, g_r10)}'
@@ -594,7 +626,7 @@ def render_failed(per_query: list[dict]) -> str:
     if not failures:
         return ""
     items = "\n".join(
-        f'<li><code>{escape(e.get("query_id","?"))}</code>: {escape(str(e.get("error","unknown")))}</li>'
+        f'<li><code>{escape(entry_task_label(e))}</code>: {escape(str(e.get("error","unknown")))}</li>'
         for e in failures
     )
     return f"""
@@ -628,16 +660,16 @@ def main():
     config_hash_v = manifest.get("config_hash") or run_dir.name
     agent_hash_v = manifest.get("agent_spec_hash") or "?"
 
-    per_query = list(summary.get("per_query") or [])
+    per_query = list(summary.get("per_task") or summary.get("per_query") or [])
     # Enrich with token totals + cost from individual trace.jsonl files.
     total_in = total_out = total_cached = total_reason = 0
     total_calls = 0
     total_cost = 0.0
     for entry in per_query:
-        qid = entry.get("query_id")
-        if not qid:
+        trace_relpath = artifact_relpath(entry, ".trace.jsonl")
+        if trace_relpath is None:
             continue
-        trace_path = run_dir / f"{qid}.trace.jsonl"
+        trace_path = run_dir / trace_relpath
         agg = aggregate_trace(trace_path, model)
         if agg:
             entry["est_cost_usd"] = agg["est_cost_usd"]
@@ -649,10 +681,11 @@ def main():
             total_reason += agg["reasoning_tokens"]
             total_calls += agg["llm_completed"]
             total_cost += agg["est_cost_usd"]
-        # Wire up per-query trace HTML if it exists
-        trace_html = run_dir / f"{qid}.trace.html"
+        # Wire up per-task trace HTML if it exists.
+        trace_html_relpath = artifact_relpath(entry, ".trace.html")
+        trace_html = run_dir / trace_html_relpath
         if trace_html.exists():
-            entry["trace_html_relpath"] = trace_html.name
+            entry["trace_html_relpath"] = trace_html_relpath.as_posix()
 
     ndcg10s = [
         float(((e.get("metrics") or {}).get("pooled") or {}).get("ndcg_at_10") or 0)
@@ -665,14 +698,16 @@ def main():
 
     mean_cost = (total_cost / max(1, n_total - n_failed)) if (n_total - n_failed) else 0.0
     cached_pct = (total_cached * 100.0 / total_in) if total_in else 0.0
-    title = f"obliq · math · {model}/{variant}".strip("/")
+    subsets = sorted({entry_subset(entry) for entry in per_query if entry_subset(entry)})
+    subset_label = ",".join(subsets) if subsets else "tasks"
+    title = f"obliq · {subset_label} · {model}/{variant}".strip("/")
 
     mm = summary.get("mean_metrics") or {}
     mm_g = mm.get("gold") or {}
     mm_p = mm.get("pooled") or {}
     # Pooled is the paper's headline metric (Table 3 reports G/P; P is the
     # post-pool judgement). Show P in the metric cards for paper-aligned
-    # comparison; per-query table shows both.
+    # comparison; per-task table shows both.
     mean_ndcg10 = float(mm_p.get("ndcg_at_10") or 0)
     mean_ndcg50 = float(mm_p.get("ndcg_at_50") or 0)
     mean_r10 = float(mm_p.get("recall_at_10") or 0)

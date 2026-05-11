@@ -30,12 +30,12 @@ DENSE_MODEL = "perplexity/pplx-embed-v1-4b"
 SPARSE_MODEL = "Qdrant/bm25"
 LATE_MODEL = "colbert-ir/colbertv2.0"
 POINT_NAMESPACE = uuid.UUID("47c85e95-6a1c-48dd-bfd9-4b7b4a61f487")
-DEFAULT_LIMIT = 100
-MAX_LIMIT = 200
+DEFAULT_LIMIT = 300
+MAX_LIMIT = 300
 
 
-def point_id(doc_id: str) -> str:
-    return str(uuid.uuid5(POINT_NAMESPACE, doc_id))
+def point_id(subset: str, doc_id: str) -> str:
+    return str(uuid.uuid5(POINT_NAMESPACE, f"{subset}/{doc_id}"))
 
 
 def limit_value(payload: dict, default: int = DEFAULT_LIMIT, maximum: int = MAX_LIMIT) -> int:
@@ -84,13 +84,23 @@ def hits(points):
 
 
 class Searcher:
-    def __init__(self, url: str, collection: str, dense_model: str, api_key: str):
+    def __init__(self, url: str, collection: str, subset: str, dense_model: str, api_key: str):
         self.client = QdrantClient(url=url)
         self.collection = collection
+        self.subset = subset
         self.dense_model = dense_model
         self.api_key = api_key
         self._late = None
         self._late_available = None
+
+    def subset_filter(self, *conditions):
+        must = [
+            models.FieldCondition(
+                key="subset", match=models.MatchValue(value=self.subset)
+            )
+        ]
+        must.extend(conditions)
+        return models.Filter(must=must)
 
     def dense_embed(self, texts: list[str]) -> list[list[float]]:
         response = requests.post(
@@ -137,6 +147,7 @@ class Searcher:
             collection_name=self.collection,
             query=models.Document(text=query, model=SPARSE_MODEL),
             using="bm25",
+            query_filter=self.subset_filter(),
             limit=limit,
             with_payload=True,
         )
@@ -148,6 +159,7 @@ class Searcher:
             collection_name=self.collection,
             query=vector,
             using="dense",
+            query_filter=self.subset_filter(),
             limit=limit,
             with_payload=True,
         )
@@ -165,6 +177,7 @@ class Searcher:
             prefetch=models.Prefetch(query=dense, using="dense", limit=prefetch_limit),
             query=late,
             using="late",
+            query_filter=self.subset_filter(),
             limit=limit,
             with_payload=True,
         )
@@ -185,14 +198,15 @@ class Searcher:
                     target=self.dense_embed([target_query])[0],
                     context=[
                         models.ContextPair(
-                            positive=point_id(pair["positive_doc_id"]),
-                            negative=point_id(pair["negative_doc_id"]),
+                            positive=point_id(self.subset, pair["positive_doc_id"]),
+                            negative=point_id(self.subset, pair["negative_doc_id"]),
                         )
                         for pair in context_pairs
                     ],
                 )
             ),
             using="dense",
+            query_filter=self.subset_filter(),
             limit=limit,
             with_payload=True,
         )
@@ -201,12 +215,8 @@ class Searcher:
     def fetch(self, doc_ids: list[str]):
         result = self.client.scroll(
             collection_name=self.collection,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="doc_id", match=models.MatchAny(any=doc_ids)
-                    )
-                ]
+            scroll_filter=self.subset_filter(
+                models.FieldCondition(key="doc_id", match=models.MatchAny(any=doc_ids))
             ),
             limit=len(doc_ids),
             with_payload=True,
@@ -228,15 +238,15 @@ class Searcher:
 
 
 def corpus_stats(data_dir: pathlib.Path, searcher: Searcher):
-    math = data_dir / "math"
+    subset_dir = data_dir / searcher.subset
     counts = {}
     for name in ["corpus.jsonl", "queries.jsonl"]:
-        counts[name] = sum(1 for _ in read_jsonl(math / name))
-    qrels = math / "qrels.tsv"
+        counts[name] = sum(1 for _ in read_jsonl(subset_dir / name))
+    qrels = subset_dir / "qrels.tsv"
     counts["qrels.tsv"] = sum(1 for line in qrels.open() if line.strip()) - 1
     info = searcher.client.get_collection(searcher.collection)
     return {
-        "subset": "math",
+        "subset": searcher.subset,
         "files": counts,
         "collection": searcher.collection,
         "points_count": info.points_count,
@@ -250,7 +260,8 @@ def main() -> None:
     parser.add_argument("--op", required=True)
     parser.add_argument("--data-dir", default=".benchmarks/obliq/data")
     parser.add_argument("--qdrant-url", default="http://localhost:6333")
-    parser.add_argument("--collection", default="obliq_math")
+    parser.add_argument("--collection", default="obliq_analogues")
+    parser.add_argument("--subset", default="math")
     parser.add_argument("--dense-model", default=DENSE_MODEL)
     parser.add_argument("--env-file", default="/home/sam/code/lash/.env")
     args = parser.parse_args()
@@ -261,78 +272,90 @@ def main() -> None:
             "OPENROUTER_API_KEY is required; set it or provide --env-file /home/sam/code/lash/.env"
         )
     payload = json.load(sys.stdin)
-    searcher = Searcher(args.qdrant_url, args.collection, args.dense_model, api_key)
+    searcher = Searcher(args.qdrant_url, args.collection, args.subset, args.dense_model, api_key)
     data_dir = pathlib.Path(args.data_dir)
 
-    if args.op == "corpus_stats":
-        output = corpus_stats(data_dir, searcher)
-    elif args.op == "fetch_docs":
-        output = {"docs": searcher.fetch(payload["doc_ids"])}
-    elif args.op == "bm25_search":
-        output = {"matches": searcher.bm25(payload["query"], limit_value(payload))}
-    elif args.op == "dense_search":
-        output = {"matches": searcher.dense_search(payload["query"], limit_value(payload))}
-    elif args.op == "late_search":
-        output = {
-            "matches": searcher.late_search(
-                payload["query"],
-                candidate_pool_value(payload),
-                limit_value(payload),
-            )
-        }
-    elif args.op == "discover_docs":
-        output = {
-            "matches": searcher.discover(
-                payload["target_query"],
-                payload["context_pairs"],
-                limit_value(payload),
-            )
-        }
-    elif args.op == "hybrid_search":
-        limit = limit_value(payload)
-        prefetch_limit = candidate_pool_value(payload)
-        prefetches = []
-        for query in payload["queries"]:
-            prefetches.append(
-                models.Prefetch(
-                    query=models.Document(text=query, model=SPARSE_MODEL),
-                    using="bm25",
-                    limit=prefetch_limit,
+    try:
+        if args.op == "corpus_stats":
+            output = corpus_stats(data_dir, searcher)
+        elif args.op == "fetch_docs":
+            output = {"docs": searcher.fetch(payload["doc_ids"])}
+        elif args.op == "bm25_search":
+            output = {"matches": searcher.bm25(payload["query"], limit_value(payload))}
+        elif args.op == "dense_search":
+            output = {"matches": searcher.dense_search(payload["query"], limit_value(payload))}
+        elif args.op == "late_search":
+            output = {
+                "matches": searcher.late_search(
+                    payload["query"],
+                    candidate_pool_value(payload),
+                    limit_value(payload),
                 )
-            )
-            prefetches.append(
-                models.Prefetch(
-                    query=searcher.dense_embed([query])[0],
-                    using="dense",
-                    limit=prefetch_limit,
+            }
+        elif args.op == "discover_docs":
+            output = {
+                "matches": searcher.discover(
+                    payload["target_query"],
+                    payload["context_pairs"],
+                    limit_value(payload),
                 )
-            )
-            if searcher.late_available():
+            }
+        elif args.op == "hybrid_search":
+            limit = limit_value(payload)
+            prefetch_limit = candidate_pool_value(payload)
+            prefetches = []
+            for query in payload["queries"]:
                 prefetches.append(
                     models.Prefetch(
-                        prefetch=models.Prefetch(
-                            query=searcher.dense_embed([query])[0],
-                            using="dense",
-                            limit=prefetch_limit,
-                        ),
-                        query=[
-                            [float(v) for v in token]
-                            for token in next(searcher.late.embed([query]))
-                        ],
-                        using="late",
+                        query=models.Document(text=query, model=SPARSE_MODEL),
+                        using="bm25",
                         limit=prefetch_limit,
                     )
                 )
-        result = searcher.client.query_points(
-            collection_name=searcher.collection,
-            prefetch=prefetches,
-            query=models.FusionQuery(fusion=models.Fusion.RRF),
-            limit=limit,
-            with_payload=True,
-        )
-        output = {"matches": hits(result.points)}
-    else:
-        raise SystemExit(f"unknown op: {args.op}")
+                prefetches.append(
+                    models.Prefetch(
+                        query=searcher.dense_embed([query])[0],
+                        using="dense",
+                        limit=prefetch_limit,
+                    )
+                )
+                if searcher.late_available():
+                    prefetches.append(
+                        models.Prefetch(
+                            prefetch=models.Prefetch(
+                                query=searcher.dense_embed([query])[0],
+                                using="dense",
+                                limit=prefetch_limit,
+                            ),
+                            query=[
+                                [float(v) for v in token]
+                                for token in next(searcher.late.embed([query]))
+                            ],
+                            using="late",
+                            limit=prefetch_limit,
+                        )
+                    )
+            result = searcher.client.query_points(
+                collection_name=searcher.collection,
+                prefetch=prefetches,
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                query_filter=searcher.subset_filter(),
+                limit=limit,
+                with_payload=True,
+            )
+            output = {"matches": hits(result.points)}
+        else:
+            raise SystemExit(f"unknown op: {args.op}")
+    except Exception as exc:
+        message = str(exc).lower()
+        if ("404" in message and "not found" in message) or (
+            "collection" in message and "exist" in message
+        ):
+            raise SystemExit(
+                f"Qdrant collection `{args.collection}` was not found at {args.qdrant_url}. "
+                "Run `scripts/setup_math.sh --recreate` or pass the correct `--collection`."
+            ) from None
+        raise
     print(json.dumps(output, ensure_ascii=False))
 
 

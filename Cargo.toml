@@ -20,12 +20,10 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 
-lash = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209", default-features = false, features = ["full"] }
-lash-embed = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
-lash-export = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
-lash-llm-tools = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
-lash-mode-rlm = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
-lash-providers-builtin = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
-lash-rlm-types = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
-lash-sqlite-store = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
-lash-subagents = { git = "https://github.com/SamGalanakis/lash", rev = "8019c0581b137020844dd7d54a56d4aea1072209" }
+lash = { git = "https://github.com/SamGalanakis/lash", rev = "b5538b55c1cc5cdfe56c5aa59b0bd5330867fe33" }
+lash-export = { git = "https://github.com/SamGalanakis/lash", rev = "b5538b55c1cc5cdfe56c5aa59b0bd5330867fe33" }
+lash-llm-tools = { git = "https://github.com/SamGalanakis/lash", rev = "b5538b55c1cc5cdfe56c5aa59b0bd5330867fe33" }
+lash-providers-builtin = { git = "https://github.com/SamGalanakis/lash", rev = "b5538b55c1cc5cdfe56c5aa59b0bd5330867fe33" }
+lash-rlm-types = { git = "https://github.com/SamGalanakis/lash", rev = "b5538b55c1cc5cdfe56c5aa59b0bd5330867fe33" }
+lash-sqlite-store = { git = "https://github.com/SamGalanakis/lash", rev = "b5538b55c1cc5cdfe56c5aa59b0bd5330867fe33" }
+lash-subagents = { git = "https://github.com/SamGalanakis/lash", rev = "b5538b55c1cc5cdfe56c5aa59b0bd5330867fe33" }

@@ -41,6 +41,10 @@ def read_jsonl(path: pathlib.Path) -> Iterable[dict]:
                 yield json.loads(line)
 
 
+def point_id(subset: str, doc_id: str) -> str:
+    return str(uuid.uuid5(POINT_NAMESPACE, f"{subset}/{doc_id}"))
+
+
 def batched(items: list[dict], size: int) -> Iterable[list[dict]]:
     for index in range(0, len(items), size):
         yield items[index : index + size]
@@ -95,7 +99,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default=".benchmarks/obliq/data")
     parser.add_argument("--qdrant-url", default="http://localhost:6333")
-    parser.add_argument("--collection", default="obliq_math")
+    parser.add_argument("--collection", default="obliq_analogues")
+    parser.add_argument("--subsets", default="math,writing")
     parser.add_argument("--dense-model", default=DENSE_MODEL)
     parser.add_argument("--env-file", default="/home/sam/code/lash/.env")
     parser.add_argument("--enable-late", action="store_true")
@@ -109,12 +114,17 @@ def main() -> None:
             "OPENROUTER_API_KEY is required; set it or provide --env-file /home/sam/code/lash/.env"
         )
 
-    data_dir = pathlib.Path(args.data_dir) / "math"
-    docs = list(read_jsonl(data_dir / "corpus.jsonl"))
+    data_root = pathlib.Path(args.data_dir)
+    subsets = [s.strip() for s in args.subsets.split(",") if s.strip()]
+    docs = []
+    for subset in subsets:
+        subset_dir = data_root / subset
+        subset_docs = list(read_jsonl(subset_dir / "corpus.jsonl"))
+        docs.extend((subset, doc) for doc in subset_docs)
     if args.limit:
         docs = docs[: args.limit]
     if not docs:
-        raise SystemExit(f"no docs found in {data_dir / 'corpus.jsonl'}")
+        raise SystemExit(f"no docs found for subsets={subsets} in {data_root}")
 
     dense_model = OpenRouterEmbedder(args.dense_model, api_key)
     late_model = LateInteractionTextEmbedding(model_name=LATE_MODEL) if args.enable_late else None
@@ -150,21 +160,21 @@ def main() -> None:
         )
 
     for offset, batch in enumerate(batched(docs, BATCH_SIZE)):
-        texts = [doc["text"] for doc in batch]
+        texts = [doc["text"] for _, doc in batch]
         dense_vectors = dense_model.embed(texts)
         late_vectors = list(late_model.embed(texts)) if late_model else [None] * len(batch)
         points = []
-        for doc, dense, late in zip(batch, dense_vectors, late_vectors):
+        for (subset, doc), dense, late in zip(batch, dense_vectors, late_vectors):
             doc_id = doc["_id"]
             payload = {
-                "subset": "math",
+                "subset": subset,
                 "doc_id": doc_id,
                 "text": doc["text"],
                 "metadata": {k: v for k, v in doc.items() if k not in {"_id", "text"}},
             }
             points.append(
                 models.PointStruct(
-                    id=str(uuid.uuid5(POINT_NAMESPACE, doc_id)),
+                    id=point_id(subset, doc_id),
                     vector={
                         "dense": [float(v) for v in dense],
                         "bm25": models.Document(text=doc["text"], model=SPARSE_MODEL),
@@ -179,10 +189,15 @@ def main() -> None:
 
     client.create_payload_index(
         collection_name=args.collection,
+        field_name="subset",
+        field_schema=models.PayloadSchemaType.KEYWORD,
+    )
+    client.create_payload_index(
+        collection_name=args.collection,
         field_name="doc_id",
         field_schema=models.PayloadSchemaType.KEYWORD,
     )
-    print(f"ready collection={args.collection} docs={len(docs)}")
+    print(f"ready collection={args.collection} subsets={','.join(subsets)} docs={len(docs)}")
 
 
 if __name__ == "__main__":

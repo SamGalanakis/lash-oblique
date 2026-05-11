@@ -9,23 +9,19 @@ use std::sync::Arc;
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
-use lash::plugin::{PluginSpec, StaticPluginFactory};
-use lash::provider::LashConfig;
-use lash::{
-    ExecutionMode, JsonlTraceSink, PluginFactory, SessionPolicy, ToolDefinition, ToolExecutionMode,
-    ToolResult,
-};
-use lash_embed::{
-    Input, LashCore, ModeId, ModeTurnOptions, RuntimePersistence, SessionStoreCreateRequest,
-    SessionStoreFactory, ToolProvider, TraceContext, TraceLevel, TraceSink, TurnOutcome,
-};
+use lash::advanced::{ExecutionMode, ModeTurnOptions};
+use lash::persistence::{RuntimePersistence, SessionStoreCreateRequest, SessionStoreFactory};
+use lash::plugins::ToolOutputBudgetPluginFactory;
+use lash::plugins::{PluginFactory, PluginSpec, StaticPluginFactory};
+use lash::provider::{ProviderHandle, ProviderSpec, build_provider};
+use lash::tools::{ToolCall, ToolDefinition, ToolExecutionMode, ToolProvider, ToolResult};
+use lash::tracing::{JsonlTraceSink, TraceContext, TraceLevel, TraceSink};
+use lash::{LashCore, ModeId, ModePreset, SessionSpec, TurnInput, TurnOutput};
 use lash_export::{ExportFormat, load_session_from_paths, render};
 use lash_rlm_types::RlmTermination;
 use lash_sqlite_store::Store;
 use lash_subagents::{
-    CapabilityField, CapabilityOptionalField, CapabilityRecursion, CapabilityRegistry,
-    CapabilitySpec, CapabilityToolSurface, LocalSubagentHost, StaticCapability, SubagentHost,
-    SubagentsPluginFactory,
+    CapabilityRegistry, LocalSubagentHost, StaticCapability, SubagentHost, SubagentsPluginFactory,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -35,7 +31,7 @@ use crate::tournament::TournamentRerankProvider;
 
 const DEFAULT_DATA_DIR: &str = ".benchmarks/obliq/data";
 const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
-const DEFAULT_COLLECTION: &str = "obliq_math";
+const DEFAULT_COLLECTION: &str = "obliq_analogues";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 const DEFAULT_VARIANT: &str = "medium";
 const DEFAULT_MAX_CONTEXT_TOKENS: usize = 1_000_000;
@@ -48,16 +44,37 @@ const AGENT_MAIN_SRC: &[u8] = include_bytes!("main.rs");
 const AGENT_TOURNAMENT_SRC: &[u8] = include_bytes!("tournament.rs");
 const AGENT_QDRANT_SCRIPT: &[u8] = include_bytes!("../scripts/query_math_qdrant.py");
 
-const DEFAULT_MATH_DESCRIPTION: &str = "Queries are mathematical problems. Relevant documents \
-are other math problems whose solution requires the SAME abstract proof strategy or \
-'aha moment' / 'eureka insight', even when the surface topic, notation, vocabulary, or \
-mathematical domain (e.g., algebra vs. analysis vs. number theory) differs entirely. \
-Surface lexical or topical overlap does NOT indicate relevance; the latent reasoning move \
-does.";
+const DEFAULT_SUBSETS: &str = "math";
+const DEFAULT_DESCRIPTION: &str = "Queries and documents come from an OBLIQ-Bench analogue subset. Relevant documents share the SAME abstract strategy, structure, or latent pattern as the query, even when surface topic, vocabulary, or formatting differs. Surface lexical overlap alone does NOT indicate relevance.";
+const MATH_REP10_TASKS: &[&str] = &[
+    "q02193", "q01486", "q01066", "q02834", "q01757", "q02979", "q01298", "q00844", "q00847",
+    "q01488",
+];
+const WRITING_REP10_TASKS: &[&str] = &[
+    "1", "182", "306", "487", "708", "951", "1727", "1987", "2105", "2213",
+];
+const NAMED_TASK_SUBSETS: &[NamedTaskSubset] = &[
+    NamedTaskSubset {
+        name: "math-rep10",
+        subset: "math",
+        task_ids: MATH_REP10_TASKS,
+    },
+    NamedTaskSubset {
+        name: "writing-rep10",
+        subset: "writing",
+        task_ids: WRITING_REP10_TASKS,
+    },
+];
+
+struct NamedTaskSubset {
+    name: &'static str,
+    subset: &'static str,
+    task_ids: &'static [&'static str],
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "lash-oblique")]
-#[command(about = "Run OBLIQ-Bench math queries through Lash RLM with Qdrant retrieval tools.")]
+#[command(about = "Run OBLIQ-Bench analogue tasks through Lash RLM with Qdrant retrieval tools.")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -65,9 +82,12 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    #[command(name = "run-task", alias = "run-math")]
     RunMath {
-        #[arg(long)]
-        query_id: String,
+        #[arg(long, default_value = "math")]
+        subset: String,
+        #[arg(long, alias = "query-id")]
+        task_id: String,
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
         data_dir: PathBuf,
         #[arg(long, default_value = DEFAULT_QDRANT_URL)]
@@ -82,33 +102,39 @@ enum Command {
         variant: String,
         #[arg(long, default_value_t = DEFAULT_MAX_CONTEXT_TOKENS)]
         max_context_tokens: usize,
-        #[arg(long, default_value = DEFAULT_MATH_DESCRIPTION)]
+        #[arg(long, default_value = DEFAULT_DESCRIPTION)]
         description: String,
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Run many math queries concurrently. Each query gets its own
+    /// Run many tasks concurrently. Each task gets its own
     /// session.db, trace.jsonl, and output JSON. Writes a batch
     /// summary at `<output_dir>/_batch_summary.json` at the end.
+    #[command(name = "run-batch", alias = "run-math-batch")]
     RunMathBatch {
-        /// Comma-separated query IDs. If omitted, runs every query in
-        /// `<data_dir>/math/queries.jsonl`.
-        #[arg(long)]
-        query_ids: Option<String>,
-        /// Limit to the first N queries (after the `query_ids` filter,
+        /// Comma-separated task IDs. Use `subset/id` to disambiguate; bare IDs
+        /// are resolved through the discovered task index.
+        #[arg(long, alias = "query-ids")]
+        tasks: Option<String>,
+        /// Comma-separated dataset subsets or named subsets to include when
+        /// `--tasks` is omitted. Named subsets: math-rep10, writing-rep10,
+        /// rep20.
+        #[arg(long, default_value = DEFAULT_SUBSETS)]
+        subsets: String,
+        /// Limit to the first N tasks (after the `--tasks` filter,
         /// if any). Useful for sampling.
         #[arg(long)]
         limit: Option<usize>,
-        /// How many queries run concurrently. Each query may itself
+        /// How many tasks run concurrently. Each task may itself
         /// fan out (tournament_rerank uses up to 8 parallel batches),
         /// so total concurrent LLM calls ≈ concurrency × 8.
         #[arg(long, default_value_t = 3)]
         concurrency: usize,
-        /// Skip queries whose output JSON already exists. On by
+        /// Skip tasks whose output JSON already exists. On by
         /// default so a re-run resumes after a crash.
         #[arg(long, default_value_t = true)]
         skip_existing: bool,
-        /// Where per-query outputs land.
+        /// Where per-task outputs land.
         #[arg(long, default_value = ".benchmarks/obliq/runs")]
         output_dir: PathBuf,
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
@@ -125,12 +151,15 @@ enum Command {
         variant: String,
         #[arg(long, default_value_t = DEFAULT_MAX_CONTEXT_TOKENS)]
         max_context_tokens: usize,
-        #[arg(long, default_value = DEFAULT_MATH_DESCRIPTION)]
+        #[arg(long, default_value = DEFAULT_DESCRIPTION)]
         description: String,
     },
+    #[command(name = "eval-task", alias = "eval-math")]
     EvalMath {
-        #[arg(long)]
-        query_id: String,
+        #[arg(long, default_value = "math")]
+        subset: String,
+        #[arg(long, alias = "query-id")]
+        task_id: String,
         #[arg(long)]
         submission: PathBuf,
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
@@ -143,6 +172,31 @@ struct QueryRow {
     #[serde(rename = "_id")]
     id: String,
     text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+struct TaskRef {
+    subset: String,
+    task_id: String,
+}
+
+impl TaskRef {
+    fn new(subset: impl Into<String>, task_id: impl Into<String>) -> Self {
+        Self {
+            subset: subset.into(),
+            task_id: task_id.into(),
+        }
+    }
+
+    fn label(&self) -> String {
+        format!("{}/{}", self.subset, self.task_id)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Task {
+    reference: TaskRef,
+    query: QueryRow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +212,8 @@ struct SanitizedSubmission {
 
 #[derive(Debug, Serialize)]
 struct RunOutput {
+    subset: String,
+    task_id: String,
     query_id: String,
     query: String,
     raw_ranked_doc_ids: Vec<String>,
@@ -204,7 +260,8 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.command {
         Command::RunMath {
-            query_id,
+            subset,
+            task_id,
             data_dir,
             qdrant_url,
             collection,
@@ -217,7 +274,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let provider = resolve_provider(provider_id.as_deref())?;
             let params = RunMathParams {
-                query_id: query_id.clone(),
+                task: TaskRef::new(subset, task_id),
                 data_dir,
                 qdrant_url,
                 collection,
@@ -234,7 +291,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::RunMathBatch {
-            query_ids,
+            tasks,
+            subsets,
             limit,
             concurrency,
             skip_existing,
@@ -249,7 +307,8 @@ async fn main() -> anyhow::Result<()> {
             description,
         } => {
             run_math_batch(RunMathBatchParams {
-                query_ids,
+                tasks,
+                subsets,
                 limit,
                 concurrency: concurrency.max(1),
                 skip_existing,
@@ -266,7 +325,8 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Command::EvalMath {
-            query_id,
+            subset,
+            task_id,
             submission,
             data_dir,
         } => {
@@ -275,9 +335,10 @@ async fn main() -> anyhow::Result<()> {
             let value: Value = serde_json::from_str(&raw)
                 .with_context(|| format!("parse {}", submission.display()))?;
             let submitted = parse_submission(value)?;
-            let excluded = load_excluded_doc_ids(&data_dir, &query_id)?;
+            let task = TaskRef::new(subset, task_id);
+            let excluded = load_excluded_doc_ids(&data_dir, &task)?;
             let sanitized = sanitize_ranked_doc_ids(submitted.ranked_doc_ids, &excluded);
-            let bundle = score_submission_bundle(&sanitized.ranked_doc_ids, &data_dir, &query_id)?;
+            let bundle = score_submission_bundle(&sanitized.ranked_doc_ids, &data_dir, &task)?;
             println!("{}", serde_json::to_string_pretty(&bundle)?);
         }
     }
@@ -286,7 +347,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Clone)]
 struct RunMathParams {
-    query_id: String,
+    task: TaskRef,
     data_dir: PathBuf,
     qdrant_url: String,
     collection: String,
@@ -301,7 +362,8 @@ struct RunMathParams {
 }
 
 struct RunMathBatchParams {
-    query_ids: Option<String>,
+    tasks: Option<String>,
+    subsets: String,
     limit: Option<usize>,
     concurrency: usize,
     skip_existing: bool,
@@ -317,11 +379,11 @@ struct RunMathBatchParams {
 }
 
 async fn run_one_math_query(
-    provider: lash::ProviderHandle,
+    provider: ProviderHandle,
     params: RunMathParams,
 ) -> anyhow::Result<RunOutput> {
     let RunMathParams {
-        query_id,
+        task,
         data_dir,
         qdrant_url,
         collection,
@@ -331,10 +393,11 @@ async fn run_one_math_query(
         description,
         output_path,
     } = params;
-    let query = load_math_query(&data_dir, &query_id)?;
-    let excluded = load_excluded_doc_ids(&data_dir, &query_id)?;
-    let stats = load_math_stats(&data_dir).unwrap_or_default();
-    let artifacts = RunArtifacts::from_output(output_path.as_ref(), &query_id);
+    let loaded = load_task(&data_dir, &task)?;
+    let query = loaded.query;
+    let excluded = load_excluded_doc_ids(&data_dir, &task)?;
+    let subset_stats = load_subset_stats(&data_dir, &task.subset).unwrap_or_default();
+    let artifacts = RunArtifacts::from_output(output_path.as_ref(), &task);
     artifacts.create_parent_dirs()?;
     let store = Arc::new(
         Store::open(Path::new(&artifacts.session_db))
@@ -345,10 +408,18 @@ async fn run_one_math_query(
         data_dir,
         qdrant_url,
         collection,
+        subset: task.subset.clone(),
         excluded_doc_ids: excluded.clone(),
         late_available: false,
     });
-    let late_available = tools.probe_late_available().await.unwrap_or(false);
+    let qdrant_stats = tools
+        .preflight_qdrant()
+        .await
+        .with_context(|| format!("preflight retrieval for {}", task.label()))?;
+    let late_available = qdrant_stats
+        .get("late_available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let tools = Arc::new(ObliqTools {
         late_available,
         ..(*tools).clone()
@@ -361,20 +432,26 @@ async fn run_one_math_query(
         tools.clone(),
         store.clone() as Arc<dyn RuntimePersistence>,
         PathBuf::from(&artifacts.trace_jsonl),
+        &loaded.reference,
         &query,
         &description,
     )?;
     let session = core
-        .session(format!("obliq-math-{}", uuid::Uuid::new_v4()))
+        .session(format!(
+            "obliq-{}-{}-{}",
+            task.subset,
+            task.task_id,
+            uuid::Uuid::new_v4()
+        ))
         .rlm()
         .open()
         .await
         .context("open Lash RLM session")?;
     let schema = output_schema();
     let turn = session
-        .turn(Input::text(run_prompt(
+        .turn(TurnInput::text(run_prompt(
             &query,
-            &stats,
+            &subset_stats,
             &excluded,
             late_available,
             &description,
@@ -390,21 +467,20 @@ async fn run_one_math_query(
         )
         .run()
         .await
-        .context("run OBLIQ math query")?;
+        .context("run OBLIQ task")?;
 
-    let submitted = match &turn.outcome {
-        TurnOutcome::Finished(lash::TurnFinish::Value { value, .. }) => {
-            parse_submission(value.clone())?
-        }
+    let submitted = match turn.submitted_value() {
+        Some(value) => parse_submission(value.clone())?,
         other => bail!(
-            "RLM did not submit ranked_doc_ids: outcome={other:?} errors={:?} text={}",
-            turn.errors,
-            turn.transcript.rendered_output()
+            "RLM did not submit ranked_doc_ids: submitted_value={other:?} outcome={:?} errors={:?} text={}",
+            turn.result.outcome,
+            turn.result.errors,
+            terminal_turn_text(&turn)
         ),
     };
     let raw_ranked_doc_ids = submitted.ranked_doc_ids;
     let sanitized = sanitize_ranked_doc_ids(raw_ranked_doc_ids.clone(), &excluded);
-    let metrics = score_submission_bundle(&sanitized.ranked_doc_ids, &tools.data_dir, &query.id).ok();
+    let metrics = score_submission_bundle(&sanitized.ranked_doc_ids, &tools.data_dir, &task).ok();
     if let Err(err) = export_single_session_html(
         Path::new(&artifacts.session_db),
         Path::new(&artifacts.trace_jsonl),
@@ -413,6 +489,8 @@ async fn run_one_math_query(
         eprintln!("warn: failed to render trace html: {err:#}");
     }
     let run_output = RunOutput {
+        subset: task.subset,
+        task_id: query.id.clone(),
         query_id: query.id,
         query: query.text,
         raw_ranked_doc_ids,
@@ -420,9 +498,14 @@ async fn run_one_math_query(
         excluded_doc_ids: excluded.iter().cloned().collect(),
         removed_doc_ids: sanitized.removed_doc_ids,
         metrics,
-        tool_calls: turn.transcript.tool_calls.len(),
-        final_text: turn.transcript.rendered_output(),
-        errors: turn.errors.into_iter().map(|issue| issue.message).collect(),
+        tool_calls: turn.result.tool_calls.len(),
+        final_text: terminal_turn_text(&turn),
+        errors: turn
+            .result
+            .errors
+            .into_iter()
+            .map(|issue| issue.message)
+            .collect(),
         artifacts: artifacts.clone(),
     };
     if let Some(output) = output_path {
@@ -451,8 +534,8 @@ fn agent_spec_hash() -> String {
 }
 
 /// Cache key combining agent source hash with the runtime config that
-/// also changes agent behavior (model, variant, description).
-fn config_hash(model: &str, variant: &str, description: &str) -> String {
+/// also changes agent behavior or selected task scope.
+fn config_hash(model: &str, variant: &str, description: &str, selection: &str) -> String {
     use sha2::{Digest, Sha256};
     let agent = agent_spec_hash();
     let mut h = Sha256::new();
@@ -463,6 +546,8 @@ fn config_hash(model: &str, variant: &str, description: &str) -> String {
     h.update(variant.as_bytes());
     h.update(b":");
     h.update(description.as_bytes());
+    h.update(b":");
+    h.update(selection.as_bytes());
     let out = h.finalize();
     let mut s = String::with_capacity(12);
     for b in &out[..6] {
@@ -473,7 +558,8 @@ fn config_hash(model: &str, variant: &str, description: &str) -> String {
 
 async fn run_math_batch(params: RunMathBatchParams) -> anyhow::Result<()> {
     let RunMathBatchParams {
-        query_ids,
+        tasks,
+        subsets,
         limit,
         concurrency,
         skip_existing,
@@ -488,29 +574,34 @@ async fn run_math_batch(params: RunMathBatchParams) -> anyhow::Result<()> {
         description,
     } = params;
 
+    let selection_key = tasks
+        .as_ref()
+        .map(|tasks| format!("tasks:{tasks}"))
+        .unwrap_or_else(|| format!("subsets:{subsets}"));
+
     // Compute a stable cache key from agent source + runtime config.
     // Outputs land at `<output_dir>/<hash>/...` so unchanged-code re-runs
     // hit the existing files via `--skip-existing`, and any code/config
     // change automatically opens a fresh cache slot.
     let agent_hash = agent_spec_hash();
-    let cfg_hash = config_hash(&model, &variant, &description);
+    let cfg_hash = config_hash(&model, &variant, &description, &selection_key);
     let scoped_output = output_dir.join(&cfg_hash);
     fs::create_dir_all(&scoped_output)
         .with_context(|| format!("create {}", scoped_output.display()))?;
     // Update a `_latest` pointer file so the dashboard can find the most
     // recent run for this output_dir without scanning.
-    let _ = fs::write(
-        output_dir.join("_latest"),
-        format!("{cfg_hash}\n"),
-    );
+    let _ = fs::write(output_dir.join("_latest"), format!("{cfg_hash}\n"));
     // Persist a small manifest so the dashboard can show what generated
-    // this run without parsing every per-query JSON.
+    // this run without parsing every per-task JSON.
     let manifest = json!({
         "agent_spec_hash": agent_hash,
         "config_hash": cfg_hash,
         "model": model,
         "variant": variant,
         "description": description,
+        "selection": selection_key,
+        "subsets": subsets,
+        "tasks": tasks,
     });
     let _ = fs::write(
         scoped_output.join("_manifest.json"),
@@ -518,40 +609,38 @@ async fn run_math_batch(params: RunMathBatchParams) -> anyhow::Result<()> {
     );
     let output_dir = scoped_output;
 
-    // Resolve query list. Either explicit CSV or every id in queries.jsonl.
-    let mut requested: Vec<String> = if let Some(ids) = query_ids.as_deref() {
-        ids.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
+    let task_index = load_task_index(&data_dir)?;
+    let mut requested: Vec<TaskRef> = if let Some(tasks) = tasks.as_deref() {
+        parse_task_list(tasks, &task_index)?
     } else {
-        load_all_math_query_ids(&data_dir)?
+        let selected_subsets = parse_csv(&subsets);
+        tasks_for_subsets(&task_index, &selected_subsets)?
     };
     if let Some(n) = limit {
         requested.truncate(n);
     }
     let total_requested = requested.len();
     if total_requested == 0 {
-        bail!("no queries to run");
+        bail!("no tasks to run");
     }
 
-    // Filter out queries whose output already exists, if requested.
-    let to_run: Vec<String> = if skip_existing {
+    // Filter out tasks whose output already exists, if requested.
+    let to_run: Vec<TaskRef> = if skip_existing {
         requested
             .into_iter()
-            .filter(|qid| !output_dir.join(format!("{qid}.json")).exists())
+            .filter(|task| !RunArtifacts::output_path_in_dir(&output_dir, task).exists())
             .collect()
     } else {
         requested
     };
     let skipped = total_requested - to_run.len();
     if to_run.is_empty() {
-        eprintln!("[batch] all {total_requested} queries already have outputs; nothing to run");
+        eprintln!("[batch] all {total_requested} tasks already have outputs; nothing to run");
         write_batch_summary(&output_dir, &description, &model, &variant, &[])?;
         return Ok(());
     }
     eprintln!(
-        "[batch] running {} of {total_requested} queries (skipping {skipped} that already exist), concurrency={concurrency}",
+        "[batch] running {} of {total_requested} tasks (skipping {skipped} that already exist), concurrency={concurrency}",
         to_run.len(),
     );
 
@@ -559,13 +648,13 @@ async fn run_math_batch(params: RunMathBatchParams) -> anyhow::Result<()> {
     let provider = resolve_provider(provider_id.as_deref())?;
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let mut tasks: tokio::task::JoinSet<(String, anyhow::Result<RunOutput>)> =
+    let mut tasks_join: tokio::task::JoinSet<(TaskRef, anyhow::Result<RunOutput>)> =
         tokio::task::JoinSet::new();
-    for qid in &to_run {
+    for task in &to_run {
         let provider = provider.clone();
         let semaphore = semaphore.clone();
         let params = RunMathParams {
-            query_id: qid.clone(),
+            task: task.clone(),
             data_dir: data_dir.clone(),
             qdrant_url: qdrant_url.clone(),
             collection: collection.clone(),
@@ -573,43 +662,53 @@ async fn run_math_batch(params: RunMathBatchParams) -> anyhow::Result<()> {
             variant: variant.clone(),
             max_context_tokens,
             description: description.clone(),
-            output_path: Some(output_dir.join(format!("{qid}.json"))),
+            output_path: Some(RunArtifacts::output_path_in_dir(&output_dir, task)),
         };
-        let qid_owned = qid.clone();
-        tasks.spawn(async move {
+        let task_owned = task.clone();
+        tasks_join.spawn(async move {
             let _permit = match semaphore.acquire_owned().await {
                 Ok(p) => p,
-                Err(err) => return (qid_owned, Err(anyhow::anyhow!("semaphore closed: {err}"))),
+                Err(err) => return (task_owned, Err(anyhow::anyhow!("semaphore closed: {err}"))),
             };
             let result = run_one_math_query(provider, params).await;
-            (qid_owned, result)
+            (task_owned, result)
         });
     }
 
     let total_to_run = to_run.len();
-    let mut completed: Vec<(String, anyhow::Result<RunOutput>)> = Vec::with_capacity(total_to_run);
-    while let Some(joined) = tasks.join_next().await {
-        let (qid, result) = joined.map_err(|err| anyhow::anyhow!("task join: {err}"))?;
+    let mut completed: Vec<(TaskRef, anyhow::Result<RunOutput>)> = Vec::with_capacity(total_to_run);
+    while let Some(joined) = tasks_join.join_next().await {
+        let (task, result) = joined.map_err(|err| anyhow::anyhow!("task join: {err}"))?;
         let n_done = completed.len() + 1;
+        let label = task.label();
         match &result {
             Ok(out) => match &out.metrics {
                 Some(b) => eprintln!(
-                    "[{n_done}/{total_to_run}] {qid} — G:NDCG@10={:.3} R@100={:.3} | P:NDCG@10={:.3} R@100={:.3} tools={}",
-                    b.gold.ndcg_at_10, b.gold.recall_at_100,
-                    b.pooled.ndcg_at_10, b.pooled.recall_at_100,
+                    "[{n_done}/{total_to_run}] {label} — G:NDCG@10={:.3} R@100={:.3} | P:NDCG@10={:.3} R@100={:.3} tools={}",
+                    b.gold.ndcg_at_10,
+                    b.gold.recall_at_100,
+                    b.pooled.ndcg_at_10,
+                    b.pooled.recall_at_100,
                     out.tool_calls
                 ),
                 None => eprintln!(
-                    "[{n_done}/{total_to_run}] {qid} — submitted (no qrels) tools={}",
+                    "[{n_done}/{total_to_run}] {label} — submitted (no qrels) tools={}",
                     out.tool_calls
                 ),
             },
-            Err(err) => eprintln!("[{n_done}/{total_to_run}] {qid} — FAILED: {err:#}"),
+            Err(err) => eprintln!("[{n_done}/{total_to_run}] {label} — FAILED: {err:#}"),
         }
-        completed.push((qid, result));
+        completed.push((task, result));
     }
 
+    let failed = completed
+        .iter()
+        .filter(|(_, result)| result.is_err())
+        .count();
     write_batch_summary(&output_dir, &description, &model, &variant, &completed)?;
+    if failed > 0 {
+        bail!("batch failed: {failed} of {total_to_run} tasks failed");
+    }
     Ok(())
 }
 
@@ -618,7 +717,7 @@ fn write_batch_summary(
     description: &str,
     model: &str,
     variant: &str,
-    completed: &[(String, anyhow::Result<RunOutput>)],
+    completed: &[(TaskRef, anyhow::Result<RunOutput>)],
 ) -> anyhow::Result<()> {
     let mut total = 0usize;
     let mut ok = 0usize;
@@ -636,7 +735,7 @@ fn write_batch_summary(
         sum.recall_at_100 += m.recall_at_100;
     };
 
-    for (qid, result) in completed {
+    for (task, result) in completed {
         total += 1;
         match result {
             Ok(out) => {
@@ -648,7 +747,9 @@ fn write_batch_summary(
                     accumulate(&mut sum_p, &b.pooled);
                 }
                 per_query.push(json!({
-                    "query_id": qid,
+                    "subset": task.subset,
+                    "task_id": task.task_id,
+                    "query_id": task.task_id,
                     "ok": true,
                     "tool_calls": out.tool_calls,
                     "metrics": out.metrics,
@@ -656,7 +757,9 @@ fn write_batch_summary(
             }
             Err(err) => {
                 per_query.push(json!({
-                    "query_id": qid,
+                    "subset": task.subset,
+                    "task_id": task.task_id,
+                    "query_id": task.task_id,
                     "ok": false,
                     "error": err.to_string(),
                 }));
@@ -691,15 +794,35 @@ fn write_batch_summary(
             "pooled": mean_of(&sum_p),
         },
         "mean_tool_calls": if ok > 0 { sum_tool_calls as f64 / ok as f64 } else { 0.0 },
+        "per_task": per_query.clone(),
         "per_query": per_query,
     });
     let path = output_dir.join("_batch_summary.json");
-    fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&summary)?))
-        .with_context(|| format!("write {}", path.display()))?;
-    let g_n10 = if scored > 0 { sum_g.ndcg_at_10 / n } else { 0.0 };
-    let g_r100 = if scored > 0 { sum_g.recall_at_100 / n } else { 0.0 };
-    let p_n10 = if scored > 0 { sum_p.ndcg_at_10 / n } else { 0.0 };
-    let p_r100 = if scored > 0 { sum_p.recall_at_100 / n } else { 0.0 };
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&summary)?),
+    )
+    .with_context(|| format!("write {}", path.display()))?;
+    let g_n10 = if scored > 0 {
+        sum_g.ndcg_at_10 / n
+    } else {
+        0.0
+    };
+    let g_r100 = if scored > 0 {
+        sum_g.recall_at_100 / n
+    } else {
+        0.0
+    };
+    let p_n10 = if scored > 0 {
+        sum_p.ndcg_at_10 / n
+    } else {
+        0.0
+    };
+    let p_r100 = if scored > 0 {
+        sum_p.recall_at_100 / n
+    } else {
+        0.0
+    };
     eprintln!(
         "[batch] summary written to {}: ok={ok}/{total} | G: NDCG@10={g_n10:.3} R@100={g_r100:.3} | P: NDCG@10={p_n10:.3} R@100={p_r100:.3}",
         path.display(),
@@ -707,81 +830,226 @@ fn write_batch_summary(
     Ok(())
 }
 
-fn load_all_math_query_ids(data_dir: &Path) -> anyhow::Result<Vec<String>> {
-    let path = data_dir.join("math/queries.jsonl");
-    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let mut out = Vec::new();
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+type TaskIndex = BTreeMap<String, Vec<TaskRef>>;
+
+fn load_task_index(data_dir: &Path) -> anyhow::Result<TaskIndex> {
+    let mut index: TaskIndex = BTreeMap::new();
+    for subset in discover_subsets(data_dir)? {
+        let path = data_dir.join(&subset).join("queries.jsonl");
+        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+            let row: QueryRow = serde_json::from_str(line)
+                .with_context(|| format!("parse query row in {}", path.display()))?;
+            index
+                .entry(row.id.clone())
+                .or_default()
+                .push(TaskRef::new(subset.clone(), row.id));
+        }
+    }
+    Ok(index)
+}
+
+fn discover_subsets(data_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let mut subsets = Vec::new();
+    for entry in fs::read_dir(data_dir).with_context(|| format!("read {}", data_dir.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
             continue;
         }
-        let row: QueryRow = serde_json::from_str(line)
-            .with_context(|| format!("parse query row in {}", path.display()))?;
-        out.push(row.id);
+        let subset = entry.file_name().to_string_lossy().to_string();
+        if entry.path().join("queries.jsonl").exists() {
+            subsets.push(subset);
+        }
+    }
+    subsets.sort();
+    Ok(subsets)
+}
+
+fn parse_csv(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_task_list(input: &str, index: &TaskIndex) -> anyhow::Result<Vec<TaskRef>> {
+    parse_csv(input)
+        .into_iter()
+        .map(|token| resolve_task_token(&token, index))
+        .collect()
+}
+
+fn resolve_task_token(token: &str, index: &TaskIndex) -> anyhow::Result<TaskRef> {
+    if let Some((subset, task_id)) = token.split_once('/') {
+        return Ok(TaskRef::new(subset.trim(), task_id.trim()));
+    }
+    let matches = index.get(token).cloned().unwrap_or_default();
+    match matches.as_slice() {
+        [task] => Ok(task.clone()),
+        [] => bail!("task `{token}` was not found in any subset"),
+        many => bail!(
+            "task `{token}` is ambiguous across subsets: {}",
+            many.iter()
+                .map(TaskRef::label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn tasks_for_subsets(index: &TaskIndex, subsets: &[String]) -> anyhow::Result<Vec<TaskRef>> {
+    let discovered_subsets = discovered_subset_names(index);
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for selector in subsets {
+        let mut selected = if selector == "rep20" {
+            named_tasks("math-rep10", index)?
+                .into_iter()
+                .chain(named_tasks("writing-rep10", index)?)
+                .collect()
+        } else if named_task_subset(selector).is_some() {
+            named_tasks(selector, index)?
+        } else if discovered_subsets.contains(selector) {
+            tasks_for_dataset_subset(index, selector)
+        } else {
+            bail!(
+                "unknown subset selector `{selector}`; known dataset subsets: {}; named subsets: {}",
+                discovered_subsets
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                named_subset_names().join(", ")
+            );
+        };
+        for task in selected.drain(..) {
+            if seen.insert(task.clone()) {
+                out.push(task);
+            }
+        }
+    }
+    if out.is_empty() {
+        bail!(
+            "no tasks found for subset selectors: {}",
+            subsets.join(", ")
+        );
     }
     Ok(out)
 }
 
+fn tasks_for_dataset_subset(index: &TaskIndex, subset: &str) -> Vec<TaskRef> {
+    let mut out = Vec::new();
+    for tasks in index.values() {
+        for task in tasks {
+            if task.subset == subset {
+                out.push(task.clone());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn named_tasks(name: &str, index: &TaskIndex) -> anyhow::Result<Vec<TaskRef>> {
+    let named = named_task_subset(name).expect("checked by caller");
+    let mut tasks = Vec::with_capacity(named.task_ids.len());
+    for task_id in named.task_ids {
+        let task = TaskRef::new(named.subset, *task_id);
+        if !task_exists(index, &task) {
+            bail!(
+                "named subset `{}` references missing task `{}`",
+                named.name,
+                task.label()
+            );
+        }
+        tasks.push(task);
+    }
+    Ok(tasks)
+}
+
+fn named_task_subset(name: &str) -> Option<&'static NamedTaskSubset> {
+    NAMED_TASK_SUBSETS.iter().find(|subset| subset.name == name)
+}
+
+fn task_exists(index: &TaskIndex, task: &TaskRef) -> bool {
+    index
+        .get(&task.task_id)
+        .map(|matches| matches.iter().any(|candidate| candidate == task))
+        .unwrap_or(false)
+}
+
+fn discovered_subset_names(index: &TaskIndex) -> BTreeSet<String> {
+    index
+        .values()
+        .flat_map(|tasks| tasks.iter().map(|task| task.subset.clone()))
+        .collect()
+}
+
+fn named_subset_names() -> Vec<&'static str> {
+    let mut names = NAMED_TASK_SUBSETS
+        .iter()
+        .map(|subset| subset.name)
+        .collect::<Vec<_>>();
+    names.push("rep20");
+    names
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "benchmark setup keeps run-scoped Lash knobs explicit at the call site"
+)]
 fn build_core(
-    provider: lash::ProviderHandle,
+    provider: ProviderHandle,
     model: String,
     variant: String,
     max_context_tokens: usize,
     obliq_tools: Arc<ObliqTools>,
     store: Arc<dyn RuntimePersistence>,
     trace_path: PathBuf,
+    task: &TaskRef,
     query: &QueryRow,
     description: &str,
 ) -> anyhow::Result<LashCore> {
-    let subagent_policy = SessionPolicy {
-        provider: provider.clone(),
-        model: model.clone(),
-        model_variant: Some(variant.clone()),
-        max_context_tokens: Some(max_context_tokens),
-        execution_mode: ExecutionMode::new("rlm"),
-        standard_context_approach: None,
-        ..SessionPolicy::default()
-    };
-    let tool_surface = rlm_tool_surface(obliq_tools.clone());
+    let subagent_spec = SessionSpec::inherit()
+        .provider(provider.clone())
+        .model(model.clone(), Some(variant.clone()))
+        .max_context_tokens(max_context_tokens)
+        .mode(ExecutionMode::new("rlm"));
     let list_async = Arc::new(ListAsyncHandlesTool);
-    let subagents = Arc::new(SubagentsPluginFactory::new(
-        subagent_policy,
-        Arc::new(
-            CapabilityRegistry::new().with(Arc::new(StaticCapability::new(
-                SUBAGENT_CAPABILITY,
-                CapabilitySpec {
-                    model: CapabilityField::Inherit,
-                    model_variant: CapabilityOptionalField::Inherit,
-                    execution_mode: CapabilityField::Inherit,
-                    tool_surface: CapabilityToolSurface::Explicit(tool_surface),
-                    recursion: CapabilityRecursion::Inherit,
-                },
-            ))),
-        ),
-        Arc::new(LocalSubagentHost::default()) as Arc<dyn SubagentHost>,
-    ));
+    let registry = Arc::new(
+        CapabilityRegistry::new().with(Arc::new(StaticCapability::new(
+            SUBAGENT_CAPABILITY,
+            SessionSpec::inherit(),
+        ))),
+    );
+    let subagents = Arc::new(
+        SubagentsPluginFactory::new(
+            registry,
+            Arc::new(LocalSubagentHost::default()) as Arc<dyn SubagentHost>,
+        )
+        .with_session_spec(subagent_spec),
+    );
     let tournament: Arc<dyn ToolProvider> = Arc::new(TournamentRerankProvider::new(
         obliq_tools.clone(),
         description.to_string(),
     ));
 
-    LashCore::rlm()
+    LashCore::builder()
+        .install_mode(ModePreset::rlm())
         .default_mode(ModeId::rlm())
         .provider(provider)
-        .model(model)
-        .model_variant(variant)
+        .model(model, Some(variant))
         .max_context_tokens(max_context_tokens)
         .store_factory(Arc::new(ReusableStoreFactory { store }))
         .trace_sink(Some(
             Arc::new(JsonlTraceSink::new(trace_path)) as Arc<dyn TraceSink>
         ))
         .trace_level(TraceLevel::Extended)
-        .trace_context(trace_context_for_query(query))
+        .trace_context(trace_context_for_query(task, query))
         .tools(obliq_tools)
-        .plugin(Arc::new(
-            lash::BuiltinToolResultProjectionPluginFactory::default(),
-        ))
+        .plugin(Arc::new(ToolOutputBudgetPluginFactory::default()))
         .plugin(Arc::new(lash_llm_tools::LlmToolsPluginFactory))
         .plugin(Arc::new(StaticPluginFactory::new(
             "obliq_async_handles",
@@ -810,28 +1078,17 @@ impl SessionStoreFactory for ReusableStoreFactory {
     }
 }
 
-fn trace_context_for_query(query: &QueryRow) -> TraceContext {
+fn trace_context_for_query(task: &TaskRef, query: &QueryRow) -> TraceContext {
     let mut metadata = BTreeMap::new();
     metadata.insert("benchmark".to_string(), json!("obliq-bench"));
-    metadata.insert("subset".to_string(), json!("math"));
+    metadata.insert("subset".to_string(), json!(task.subset));
     TraceContext {
-        run_id: Some(format!("obliq-math-{}", query.id)),
+        run_id: Some(format!("obliq-{}-{}", task.subset, query.id)),
         example_id: Some(query.id.clone()),
-        split: Some("math".to_string()),
+        split: Some(task.subset.clone()),
         metadata,
         ..TraceContext::default()
     }
-}
-
-fn rlm_tool_surface(obliq_tools: Arc<ObliqTools>) -> Vec<ToolDefinition> {
-    let mut tools = obliq_tools.definitions();
-    tools.push(lash_llm_tools::llm_query_tool_definition());
-    tools.push(lash_mode_rlm::continue_as_tool_definition());
-    tools.push(list_async_handles_tool_definition());
-    tools.push(lash_subagents::spawn_agent_tool_definition(&[
-        SUBAGENT_CAPABILITY.to_string(),
-    ]));
-    tools
 }
 
 #[derive(Debug, Clone, Default)]
@@ -854,10 +1111,10 @@ fn run_prompt(
             excluded.iter().cloned().collect::<Vec<_>>().join(", ")
         )
     };
-    let modes_clause = if late_available {
-        "\"hybrid\" | \"bm25\" | \"dense\" | \"late\""
+    let late_note = if late_available {
+        "The `late` search mode is available for optional single-channel diversity probes."
     } else {
-        "\"hybrid\" | \"bm25\" | \"dense\""
+        "The `late` search mode is not available; use `hybrid`, `bm25`, or `dense`."
     };
     format!(
         r#"You are running one query from a retrieval benchmark.
@@ -875,79 +1132,21 @@ text:
 # Corpus
 The searchable corpus has {corpus_docs} documents. Every submitted id must come from a tool result. Submit exactly 100 unique, non-excluded ids ranked best first.
 
-# Vocabulary (used throughout this playbook)
-- **surface features** — vocabulary, notation, topical labels present in the query text. A surface-only matcher (BM25, dense embedding) ranks by these.
-- **structural features** / **schema** — the relational pattern that determines relevance per the description above: the objects involved and the relations that must hold between them. The schema is what makes two documents analogous even when their surface features differ.
-- **surface-similar distractor** — a document that shares surface features with the query but does NOT share the schema. These are what surface-only retrieval ranks high; they are wrong.
-- **schema-anchored query** — a phrasing of the schema that deliberately avoids the original surface vocabulary, so it can match documents whose surface features are different but whose structural relations are the same.
-
-# Tool surface
-- `search(queries: [str], mode: {modes_clause} = "hybrid", limit=300, candidate_pool=1500)`: corpus retrieval. `hybrid` (default) does BM25 + dense (and late, if available) fused via RRF over all `queries` — pass 4–6 probes per call. Single-channel modes (`bm25` / `dense` / `late`) take only `queries[0]`. Returns `{{matches: [...]}}` with `rank`, `doc_id`, `score`, **`text` (full text inline)**, `metadata`. Read top entries directly from the result — there is no separate fetch step.
-- `discover_docs(target_query, context_pairs=[{{positive_doc_id, negative_doc_id}}], limit=300)`: example-anchored dense search. Use once you have schema-sharing positives AND named surface-similar distractors as negatives. Returns the same shape as `search`.
-- `spawn_agent(...)`: full RLM session with the same tools; for parallel scout lines, each in a different surface domain.
-- `llm_query(task, inputs, output)`: ONE direct LLM call against text you supply. CAN return structured JSON, judge a batch of 30–50 doc texts in one shot. CANNOT search or call tools.
-- `tournament_rerank(query, candidate_pools=[{{label, ranked_doc_ids}}], top_k=100)`: listwise reranker. Takes labeled candidate pools (one per channel/probe-set you ran), does canonical RRF (k=60) across them to produce the top 300, then runs the listwise tournament. Pass each search result set as its own pool — the merge is deterministic and won't drop single-channel hits.
-
-# Effort routing
-- Think → main loop (free).
-- Read → main-loop reasoning over the `text` field of search results (already inline).
-- Look-at-text-and-judge → `llm_query`, batched.
-- Run-its-own-search-loop → `spawn_agent`, in parallel.
-- Rank → `tournament_rerank`. Submission must come from its output.
-
-# Playbook — waterfall, escalate only when the audit says you must
-
-## Phase A — articulate the schema (main loop, free)
-1. From the relevance description and the query, write in your head 1–2 sentences:
-   - "The relevance schema is: <objects> + <relations that must hold between them>." Concrete and structural. Avoid the original surface vocabulary of the query.
-   - Name 2–3 surface features (tokens, topic labels) likely to appear in surface-similar distractors — i.e. tokens a surface-only matcher would over-weight even though they aren't part of the schema.
-2. Write 4–6 SURFACE probes — paraphrases of the query in its own surface vocabulary. These exercise Tier 1.
-
-## Phase B — Tier 1 cheap surface retrieval (1 call)
-3. `search(queries = your 4–6 surface probes, mode="hybrid", limit=300, candidate_pool=1500)`.
-
-## Phase B' — audit (the load-bearing step; never skip)
-4. Read the **top 8 entries** from your Phase B `search` output directly — `text` is inline, no fetch needed.
-5. In the main loop, for each of the top 8 candidates, classify and label:
-   - (i) **shares the schema** — name in one phrase the structural correspondence (which objects, which relations).
-   - (ii) **surface-similar distractor** — name the surface tokens that fooled the search (these are what schema-anchored probes must AVOID).
-   - (iii) **unclear** — count as a non-hit for the decision below.
-6. Decide:
-   - **≥ 5 of top 8 are (i)** → Tier 1 was sufficient. Skip to Phase D with just the Phase B pool.
-   - **Otherwise** → Phase C (Tier 2).
-
-## Phase C — Tier 2 schema-anchored widening (escalation)
-7. Write 4–6 SCHEMA-ANCHORED probes:
-   - Each phrases the schema as a complete-sentence query.
-   - Each uses surface vocabulary from a DIFFERENT surface domain than the query's.
-   - Each AVOIDS the distractor tokens you flagged in step 5.
-8. `search(queries = your 4–6 schema-anchored probes, mode="hybrid", limit=300, candidate_pool=1500)`.
-9. If you have ≥ 1 schema-sharing positive AND ≥ 1 named distractor from Phase B', also run:
-   `discover_docs(target_query = your best schema-anchored phrasing, context_pairs = 4–10 (positive, distractor) pairs, limit=300)`.
-10. **Optional Tier 3** — only if step 8/9 is still thin or still surface-y when spot-checked:
-    - `spawn_agent` × 2–4 in parallel, each with a distinct schema-anchored brief in a different surface domain.
-    - `search(queries = [one schema-anchored phrasing not yet covered], mode="bm25" | "dense" | "late", limit=200)` for a single-channel diversity probe.
-
-## Phase D — rerank (mandatory)
-11. Build `candidate_pools` — one entry PER search result set you ran (Phase B + every Phase C call + each spawn_agent's returned ids). Each entry is `{{ "label": "<your label>", "ranked_doc_ids": <that call's matches as ids in order> }}`. **Don't pre-merge. Don't truncate. Don't drop single-channel pools.** Tournament does the RRF merge across pools and caps at 300 internally.
-12. `tournament_rerank(query = the original query (optionally appended with a one-line schema description from step 1), candidate_pools = <your labeled pools from step 11>, top_k=100)`.
-
-## Submission
-The output of step 12 is your submission, in order. Do not hand-reorder.
-
-# Pool sizing summary
-- search hybrid:     limit 300, candidate_pool 1500, 4–6 probes/call
-- search single:     limit 200, single channel diversity only (one query)
-- discover_docs:     limit 300, 4–10 (positive, distractor) pairs
-- spawn_agent:       2–4 in parallel, each ~150 ids
-- tournament_rerank: any number of pools; internal RRF + cap to top 300; output top_k 100
-- llm_query batches: 30–50 items/call
+# Strategy
+1. State the hidden relevance schema in your own words: objects plus relations. Avoid the query's surface vocabulary.
+2. Run one broad hybrid `search` using 4–6 surface probes, `limit=300`, `candidate_pool=1500`.
+3. Read the top 8 returned texts inline. Classify each as schema match, surface-similar distractor, or unclear.
+4. If top results are mostly distractors, run one schema-anchored hybrid `search` with 4–6 probes from different surface domains. Avoid the distractor vocabulary.
+5. If you found at least one likely positive and one named distractor, run `discover_docs` with those positive/negative pairs.
+6. Optional: add one single-channel diversity `search` if a distinct phrasing or channel is missing. {late_note}
+7. Build `candidate_pools` with one pool per retrieval call. Use each call's ids in order. Do not pre-merge or truncate pools.
+8. Call `tournament_rerank` once with `top_k=100`. Use its output as the submission order.
 
 # Hard rules
 - Every submitted id comes from a tool result.
-- Submission = `tournament_rerank` output. No hand-ordering, no skipping the rerank.
+- Use `tournament_rerank`; do not hand-rank the final list.
+- Keep candidate pools separate; tournament handles RRF merge and the internal top-300 cap.
 - Submit exactly 100 unique, non-excluded ids. If `tournament_rerank` returns fewer than 100, fill the tail with the next-best candidates from your raw pools (in any reasonable order).
-- For `tournament_rerank`, pass each search/discover/spawn result as its own pool. Tournament's RRF merge is deterministic and won't drop single-channel hits — agent-side pre-merging is what causes recall regressions.
 
 # Submission
 ```lashlang
@@ -959,7 +1158,7 @@ submit {{ ranked_doc_ids: [/* exactly 100 strings */] }}
         excluded_text = excluded_text,
         query_text = query.text,
         corpus_docs = stats.corpus_docs,
-        modes_clause = modes_clause,
+        late_note = late_note,
     )
 }
 
@@ -994,12 +1193,30 @@ fn parse_submission(value: Value) -> anyhow::Result<RankedSubmission> {
     bail!("submission did not contain ranked_doc_ids")
 }
 
+fn terminal_turn_text(output: &TurnOutput) -> String {
+    if let Some(value) = output.submitted_value() {
+        return terminal_value_text(value);
+    }
+    if let Some((_tool_name, value)) = output.tool_value() {
+        return terminal_value_text(value);
+    }
+    output.assistant_message().unwrap_or_default().to_string()
+}
+
+fn terminal_value_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
 #[derive(Clone)]
 struct ObliqTools {
     script: PathBuf,
     data_dir: PathBuf,
     qdrant_url: String,
     collection: String,
+    subset: String,
     excluded_doc_ids: BTreeSet<String>,
     late_available: bool,
 }
@@ -1022,7 +1239,12 @@ impl ToolProvider for ObliqTools {
              no separate fetch step needed."
         );
         let mode_enum: Vec<Value> = if self.late_available {
-            vec![json!("hybrid"), json!("bm25"), json!("dense"), json!("late")]
+            vec![
+                json!("hybrid"),
+                json!("bm25"),
+                json!("dense"),
+                json!("late"),
+            ]
         } else {
             vec![json!("hybrid"), json!("bm25"), json!("dense")]
         };
@@ -1040,7 +1262,7 @@ impl ToolProvider for ObliqTools {
                             "maxItems": 12
                         },
                         "mode": { "type": "string", "enum": mode_enum, "default": "hybrid" },
-                        "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 300, "default": 300 },
                         "candidate_pool": { "type": "integer", "minimum": 1, "maximum": 2000, "default": 1000 }
                     },
                     "required": ["queries"],
@@ -1069,7 +1291,7 @@ impl ToolProvider for ObliqTools {
                             "minItems": 1,
                             "maxItems": 20
                         },
-                        "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 }
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 300, "default": 300 }
                     },
                     "required": ["target_query", "context_pairs"],
                     "additionalProperties": false
@@ -1079,10 +1301,10 @@ impl ToolProvider for ObliqTools {
         ]
     }
 
-    async fn execute(&self, name: &str, args: &Value) -> ToolResult {
-        let result = match name {
-            "search" => self.dispatch_search(args).await,
-            other => self.call_script(other, args).await,
+    async fn execute(&self, call: ToolCall<'_>) -> ToolResult {
+        let result = match call.name {
+            "search" => self.dispatch_search(call.args).await,
+            other => self.call_script(other, call.args).await,
         };
         match result {
             Ok(value) => ToolResult::ok(value),
@@ -1093,10 +1315,7 @@ impl ToolProvider for ObliqTools {
 
 impl ObliqTools {
     async fn dispatch_search(&self, args: &Value) -> anyhow::Result<Value> {
-        let mode = args
-            .get("mode")
-            .and_then(Value::as_str)
-            .unwrap_or("hybrid");
+        let mode = args.get("mode").and_then(Value::as_str).unwrap_or("hybrid");
         let queries = args
             .get("queries")
             .and_then(Value::as_array)
@@ -1109,14 +1328,20 @@ impl ObliqTools {
         let (op, payload) = match mode {
             "hybrid" => {
                 let mut p = json!({ "queries": queries });
-                if let Some(v) = limit { p["limit"] = v; }
-                if let Some(v) = candidate_pool { p["candidate_pool"] = v; }
+                if let Some(v) = limit {
+                    p["limit"] = v;
+                }
+                if let Some(v) = candidate_pool {
+                    p["candidate_pool"] = v;
+                }
                 ("hybrid_search", p)
             }
             "bm25" | "dense" => {
                 let q = queries[0].as_str().unwrap_or_default();
                 let mut p = json!({ "query": q });
-                if let Some(v) = limit { p["limit"] = v; }
+                if let Some(v) = limit {
+                    p["limit"] = v;
+                }
                 if mode == "bm25" {
                     ("bm25_search", p)
                 } else {
@@ -1129,8 +1354,12 @@ impl ObliqTools {
                 }
                 let q = queries[0].as_str().unwrap_or_default();
                 let mut p = json!({ "query": q });
-                if let Some(v) = limit { p["limit"] = v; }
-                if let Some(v) = candidate_pool { p["candidate_pool"] = v; }
+                if let Some(v) = limit {
+                    p["limit"] = v;
+                }
+                if let Some(v) = candidate_pool {
+                    p["candidate_pool"] = v;
+                }
                 ("late_search", p)
             }
             other => bail!("unknown search mode: {other}"),
@@ -1168,12 +1397,20 @@ impl ObliqTools {
         Ok(out)
     }
 
-    async fn probe_late_available(&self) -> anyhow::Result<bool> {
+    async fn preflight_qdrant(&self) -> anyhow::Result<Value> {
         let stats = self.call_script_raw("corpus_stats", &json!({})).await?;
-        Ok(stats
-            .get("late_available")
-            .and_then(Value::as_bool)
-            .unwrap_or(false))
+        let points = stats
+            .get("points_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if points == 0 {
+            bail!(
+                "Qdrant collection `{}` at `{}` has no points; run `scripts/setup_math.sh --recreate` or pass the correct `--collection`",
+                self.collection,
+                self.qdrant_url
+            );
+        }
+        Ok(stats)
     }
 
     async fn call_script(&self, op: &str, args: &Value) -> anyhow::Result<Value> {
@@ -1191,6 +1428,8 @@ impl ObliqTools {
             .arg(&self.qdrant_url)
             .arg("--collection")
             .arg(&self.collection)
+            .arg("--subset")
+            .arg(&self.subset)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1246,10 +1485,10 @@ impl ObliqTools {
 }
 
 impl RunArtifacts {
-    fn from_output(output: Option<&PathBuf>, query_id: &str) -> Self {
+    fn from_output(output: Option<&PathBuf>, task: &TaskRef) -> Self {
         let output_json = output
             .cloned()
-            .unwrap_or_else(|| PathBuf::from(format!(".benchmarks/obliq/runs/{query_id}.json")));
+            .unwrap_or_else(|| Self::output_path_in_dir(Path::new(".benchmarks/obliq/runs"), task));
         let session_db = output_json.with_extension("session.db");
         let trace_jsonl = output_json.with_extension("trace.jsonl");
         let trace_html = output_json.with_extension("trace.html");
@@ -1259,6 +1498,12 @@ impl RunArtifacts {
             trace_jsonl: trace_jsonl.display().to_string(),
             trace_html: trace_html.display().to_string(),
         }
+    }
+
+    fn output_path_in_dir(output_dir: &Path, task: &TaskRef) -> PathBuf {
+        output_dir
+            .join(&task.subset)
+            .join(format!("{}.json", task.task_id))
     }
 
     fn create_parent_dirs(&self) -> anyhow::Result<()> {
@@ -1322,7 +1567,7 @@ fn obliq_tool(
     input_schema: Value,
     output_schema: Value,
 ) -> ToolDefinition {
-    ToolDefinition::new(name, description, input_schema, output_schema)
+    ToolDefinition::raw(name, description, input_schema, output_schema)
         .with_execution_mode(ToolExecutionMode::Parallel)
 }
 
@@ -1364,15 +1609,16 @@ impl ToolProvider for ListAsyncHandlesTool {
         vec![list_async_handles_tool_definition()]
     }
 
-    async fn execute(&self, name: &str, _args: &Value) -> ToolResult {
+    async fn execute(&self, call: ToolCall<'_>) -> ToolResult {
         ToolResult::err_fmt(format_args!(
-            "`{name}` is handled by the RLM runtime and cannot run directly"
+            "`{}` is handled by the RLM runtime and cannot run directly",
+            call.name
         ))
     }
 }
 
 fn list_async_handles_tool_definition() -> ToolDefinition {
-    ToolDefinition::new(
+    ToolDefinition::raw(
         "list_async_handles",
         "List live lashlang async handles only. Returns `{ monitor: { monitor_id: handle }, subagent: { name: handle }, tool: { id: handle } }`; terminal, awaited, or cancelled handles are omitted.",
         ToolDefinition::default_input_schema(),
@@ -1390,17 +1636,38 @@ fn list_async_handles_tool_definition() -> ToolDefinition {
     .with_execution_mode(ToolExecutionMode::Parallel)
 }
 
-fn resolve_provider(provider_id: Option<&str>) -> anyhow::Result<lash::ProviderHandle> {
+fn resolve_provider(provider_id: Option<&str>) -> anyhow::Result<ProviderHandle> {
     lash_providers_builtin::register_all();
     let config_path = lash_home().join("config.json");
-    let mut config = LashConfig::load(&config_path)
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid {}", config_path.display()))?;
-    if let Some(provider_id) = provider_id {
-        config
-            .set_active_provider_kind(provider_id)
-            .map_err(anyhow::Error::msg)?;
+    let config = load_provider_config(&config_path)?;
+    let provider_kind = provider_id.unwrap_or(&config.active_provider);
+    let spec = config
+        .providers
+        .get(provider_kind)
+        .ok_or_else(|| anyhow::anyhow!("provider `{provider_kind}` is not configured"))?;
+    build_provider(spec)
+        .map(ProviderHandle::new)
+        .map_err(anyhow::Error::msg)
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderConfigFile {
+    active_provider: String,
+    providers: BTreeMap<String, ProviderSpec>,
+}
+
+fn load_provider_config(path: &Path) -> anyhow::Result<ProviderConfigFile> {
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let config: ProviderConfigFile =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    if !config.providers.contains_key(&config.active_provider) {
+        bail!(
+            "{} points to missing active provider `{}`",
+            path.display(),
+            config.active_provider
+        );
     }
-    config.build_active_provider().map_err(anyhow::Error::msg)
+    Ok(config)
 }
 
 fn lash_home() -> PathBuf {
@@ -1410,21 +1677,28 @@ fn lash_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".lash"))
 }
 
-fn load_math_query(data_dir: &Path, query_id: &str) -> anyhow::Result<QueryRow> {
-    let path = data_dir.join("math/queries.jsonl");
+fn load_task(data_dir: &Path, task: &TaskRef) -> anyhow::Result<Task> {
+    let path = data_dir.join(&task.subset).join("queries.jsonl");
     let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    raw.lines()
+    let query = raw
+        .lines()
         .filter(|line| !line.trim().is_empty())
         .map(serde_json::from_str::<QueryRow>)
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .find(|row| row.id == query_id)
-        .ok_or_else(|| anyhow::anyhow!("query `{query_id}` not found in {}", path.display()))
+        .find(|row| row.id == task.task_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("task `{}` not found in {}", task.label(), path.display())
+        })?;
+    Ok(Task {
+        reference: task.clone(),
+        query,
+    })
 }
 
-fn load_math_stats(data_dir: &Path) -> anyhow::Result<MathStats> {
-    let math = data_dir.join("math");
-    let corpus_docs = count_nonempty_lines(&math.join("corpus.jsonl"))?;
+fn load_subset_stats(data_dir: &Path, subset: &str) -> anyhow::Result<MathStats> {
+    let subset_dir = data_dir.join(subset);
+    let corpus_docs = count_nonempty_lines(&subset_dir.join("corpus.jsonl"))?;
     Ok(MathStats { corpus_docs })
 }
 
@@ -1436,9 +1710,12 @@ fn count_nonempty_lines(path: &Path) -> anyhow::Result<usize> {
 fn load_qrels_file(
     data_dir: &Path,
     filename: &str,
-    query_id: &str,
+    task: &TaskRef,
 ) -> anyhow::Result<HashMap<String, f64>> {
-    let path = data_dir.join("math").join(filename);
+    let path = data_dir.join(&task.subset).join(filename);
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
     let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let mut gold = HashMap::new();
     for (index, line) in raw.lines().enumerate() {
@@ -1446,7 +1723,7 @@ fn load_qrels_file(
             continue;
         }
         let parts = line.split('\t').collect::<Vec<_>>();
-        if parts.len() < 3 || parts[0] != query_id {
+        if parts.len() < 3 || parts[0] != task.task_id {
             continue;
         }
         let score = parts[2].parse::<f64>().unwrap_or(1.0);
@@ -1455,29 +1732,36 @@ fn load_qrels_file(
     Ok(gold)
 }
 
-fn load_qrels(data_dir: &Path, query_id: &str) -> anyhow::Result<HashMap<String, f64>> {
-    load_qrels_file(data_dir, "qrels.tsv", query_id)
+fn load_qrels(data_dir: &Path, task: &TaskRef) -> anyhow::Result<HashMap<String, f64>> {
+    load_qrels_file(data_dir, "qrels.tsv", task)
 }
 
-fn load_qrels_pool(data_dir: &Path, query_id: &str) -> anyhow::Result<HashMap<String, f64>> {
-    load_qrels_file(data_dir, "qrels_pool.tsv", query_id)
+fn load_qrels_pool(data_dir: &Path, task: &TaskRef) -> anyhow::Result<HashMap<String, f64>> {
+    load_qrels_file(data_dir, "qrels_pool.tsv", task)
 }
 
 fn score_submission_bundle(
     ranked: &[String],
     data_dir: &Path,
-    query_id: &str,
+    task: &TaskRef,
 ) -> anyhow::Result<MetricsBundle> {
-    let gold_qrels = load_qrels(data_dir, query_id)?;
-    let pooled_qrels = load_qrels_pool(data_dir, query_id)?;
+    let gold_qrels = load_qrels(data_dir, task)?;
+    let pooled_qrels = load_qrels_pool(data_dir, task)?;
+    let pooled_qrels = if pooled_qrels.is_empty() {
+        gold_qrels.clone()
+    } else {
+        pooled_qrels
+    };
     Ok(MetricsBundle {
         gold: score_submission(ranked, &gold_qrels),
         pooled: score_submission(ranked, &pooled_qrels),
     })
 }
 
-fn load_excluded_doc_ids(data_dir: &Path, query_id: &str) -> anyhow::Result<BTreeSet<String>> {
-    let path = data_dir.join("math/per_query_excluded_ids.json");
+fn load_excluded_doc_ids(data_dir: &Path, task: &TaskRef) -> anyhow::Result<BTreeSet<String>> {
+    let path = data_dir
+        .join(&task.subset)
+        .join("per_query_excluded_ids.json");
     if !path.exists() {
         return Ok(BTreeSet::new());
     }
@@ -1485,7 +1769,7 @@ fn load_excluded_doc_ids(data_dir: &Path, query_id: &str) -> anyhow::Result<BTre
     let value: HashMap<String, Vec<String>> =
         serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
     Ok(value
-        .get(query_id)
+        .get(&task.task_id)
         .cloned()
         .unwrap_or_default()
         .into_iter()

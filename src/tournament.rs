@@ -2,10 +2,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lash::{
+use lash::direct::{
     DirectJsonSchema, DirectMessage, DirectOutputSpec, DirectPart, DirectRequest, DirectRole,
-    SessionPolicy, ToolDefinition, ToolExecutionContext, ToolExecutionMode, ToolHookHost,
-    ToolProvider, ToolResult,
+};
+use lash::tools::{
+    ToolCall, ToolContext, ToolDefinition, ToolExecutionMode, ToolProvider, ToolResult,
 };
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
@@ -29,6 +30,7 @@ const DEFAULT_TOP_K: usize = 100;
 const MAX_DOC_CHARS: usize = 6000;
 const MAX_PARALLEL_BATCHES: usize = 8;
 const SHUFFLE_SEED: u64 = 0x0B11_9EBE_7C8B_AD00;
+const DIRECT_RERANK_VARIANT: &str = "low";
 
 pub struct TournamentRerankProvider {
     obliq: Arc<ObliqTools>,
@@ -41,7 +43,7 @@ impl TournamentRerankProvider {
     }
 
     pub fn tool_definition() -> ToolDefinition {
-        ToolDefinition::new(
+        ToolDefinition::raw(
             "tournament_rerank",
             "Listwise tournament reranker. Takes labeled candidate pools (one per channel \
              or probe-set you ran), does canonical Reciprocal Rank Fusion (k=60) across \
@@ -98,11 +100,7 @@ impl TournamentRerankProvider {
         .with_execution_mode(ToolExecutionMode::Parallel)
     }
 
-    async fn rerank(
-        &self,
-        args: &Value,
-        context: &ToolExecutionContext,
-    ) -> Result<Value, String> {
+    async fn rerank(&self, args: &Value, context: &ToolContext) -> Result<Value, String> {
         let query = args
             .get("query")
             .and_then(Value::as_str)
@@ -135,18 +133,17 @@ impl TournamentRerankProvider {
             .await
             .map_err(|err| format!("failed to fetch doc texts: {err}"))?;
 
-        let snapshot = context
-            .host
-            .snapshot_session(&context.session_id)
+        let session_model = context
+            .session_model()
             .await
-            .map_err(|err| format!("failed to snapshot session: {err}"))?;
-        let policy = snapshot.policy;
+            .map_err(|err| format!("failed to read session model: {err}"))?;
 
         let ranked = run_tournament(
-            &context.host,
-            &policy,
-            &context.session_id,
-            context.tool_call_id.clone(),
+            context.clone(),
+            &session_model.model,
+            Some(DIRECT_RERANK_VARIANT),
+            context.session_id(),
+            context.tool_call_id().map(str::to_string),
             &self.description,
             &query,
             &docs,
@@ -167,35 +164,14 @@ impl ToolProvider for TournamentRerankProvider {
         vec![Self::tool_definition()]
     }
 
-    async fn execute(&self, name: &str, _args: &Value) -> ToolResult {
-        ToolResult::err_fmt(format_args!(
-            "`{name}` requires session context and cannot run without it"
-        ))
-    }
-
-    async fn execute_with_context(
-        &self,
-        name: &str,
-        args: &Value,
-        context: &ToolExecutionContext,
-    ) -> ToolResult {
-        match name {
-            "tournament_rerank" => match self.rerank(args, context).await {
+    async fn execute(&self, call: ToolCall<'_>) -> ToolResult {
+        match call.name {
+            "tournament_rerank" => match self.rerank(call.args, call.context).await {
                 Ok(value) => ToolResult::ok(value),
                 Err(err) => ToolResult::err(json!(err)),
             },
             other => ToolResult::err_fmt(format_args!("unknown tool: {other}")),
         }
-    }
-
-    async fn execute_streaming_with_context(
-        &self,
-        name: &str,
-        args: &Value,
-        context: &ToolExecutionContext,
-        _progress: Option<&lash::ProgressSender>,
-    ) -> ToolResult {
-        self.execute_with_context(name, args, context).await
     }
 }
 
@@ -233,12 +209,21 @@ fn rrf_merge(pools: &[Value], top_n: usize) -> Vec<String> {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
-    ranked.into_iter().take(top_n).map(|(id, _, _)| id).collect()
+    ranked
+        .into_iter()
+        .take(top_n)
+        .map(|(id, _, _)| id)
+        .collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "listwise benchmark orchestration passes independent run inputs explicitly"
+)]
 async fn run_tournament(
-    host: &Arc<dyn ToolHookHost>,
-    policy: &SessionPolicy,
+    context: ToolContext,
+    model: &str,
+    model_variant: Option<&str>,
     session_id: &str,
     originating_tool_call_id: Option<String>,
     description: &str,
@@ -255,13 +240,16 @@ async fn run_tournament(
 
     while survivors.len() > batch {
         survivors.shuffle(&mut rng);
-        let mut batches: Vec<Vec<String>> =
-            survivors.chunks(batch).map(|chunk| chunk.to_vec()).collect();
+        let mut batches: Vec<Vec<String>> = survivors
+            .chunks(batch)
+            .map(|chunk| chunk.to_vec())
+            .collect();
 
         let mut tasks: JoinSet<(usize, Result<Vec<String>, String>)> = JoinSet::new();
         for (idx, batch_ids) in batches.drain(..).enumerate() {
-            let host = host.clone();
-            let policy = policy.clone();
+            let context = context.clone();
+            let model = model.to_string();
+            let model_variant = model_variant.map(str::to_string);
             let session_id = session_id.to_string();
             let description = description.to_string();
             let query = query.to_string();
@@ -274,8 +262,9 @@ async fn run_tournament(
                     Err(err) => return (idx, Err(format!("semaphore closed: {err}"))),
                 };
                 let result = rank_batch(
-                    host,
-                    &policy,
+                    context,
+                    &model,
+                    model_variant.as_deref(),
                     &session_id,
                     originating,
                     &description,
@@ -308,8 +297,9 @@ async fn run_tournament(
     }
 
     let final_ranked = rank_batch(
-        host.clone(),
-        policy,
+        context,
+        model,
+        model_variant,
         session_id,
         originating_tool_call_id.clone(),
         description,
@@ -319,7 +309,8 @@ async fn run_tournament(
     )
     .await?;
 
-    let mut out = Vec::with_capacity(final_ranked.len() + tails.iter().map(Vec::len).sum::<usize>());
+    let mut out =
+        Vec::with_capacity(final_ranked.len() + tails.iter().map(Vec::len).sum::<usize>());
     out.extend(final_ranked);
     for tail in tails.into_iter().rev() {
         out.extend(tail);
@@ -327,9 +318,14 @@ async fn run_tournament(
     Ok(out)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "direct batch completion needs the session context plus immutable ranking inputs"
+)]
 async fn rank_batch(
-    host: Arc<dyn ToolHookHost>,
-    policy: &SessionPolicy,
+    context: ToolContext,
+    model: &str,
+    model_variant: Option<&str>,
     session_id: &str,
     originating_tool_call_id: Option<String>,
     description: &str,
@@ -382,8 +378,8 @@ async fn rank_batch(
     });
 
     let request = DirectRequest {
-        model: policy.model.clone(),
-        model_variant: policy.model_variant.clone(),
+        model: model.to_string(),
+        model_variant: model_variant.map(str::to_string),
         messages: vec![
             DirectMessage {
                 role: DirectRole::System,
@@ -410,7 +406,7 @@ async fn rank_batch(
         originating_tool_call_id,
     };
 
-    let completion = host
+    let completion = context
         .direct_completion(request, "tournament_rerank")
         .await
         .map_err(|err| format!("direct_completion failed: {err}"))?;

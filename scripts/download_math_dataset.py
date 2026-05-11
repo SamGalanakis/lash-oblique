@@ -9,11 +9,19 @@ import urllib.request
 
 BASE = "https://huggingface.co/datasets/dianetc/OBLIQ-Bench/resolve/main"
 FILES = {
-    "corpus.jsonl": "analogues/math/corpus/corpus.jsonl",
-    "queries.jsonl": "analogues/math/queries%2Bqrels/queries.jsonl",
-    "qrels.tsv": "analogues/math/queries%2Bqrels/qrels.tsv",
-    "qrels_pool.tsv": "analogues/math/queries%2Bqrels/qrels_pool.tsv",
-    "per_query_excluded_ids.json": "analogues/math/queries%2Bqrels/per_query_excluded_ids.json",
+    "math": {
+        "corpus.jsonl": "analogues/math/corpus/corpus.jsonl",
+        "queries.jsonl": "analogues/math/queries%2Bqrels/queries.jsonl",
+        "qrels.tsv": "analogues/math/queries%2Bqrels/qrels.tsv",
+        "qrels_pool.tsv": "analogues/math/queries%2Bqrels/qrels_pool.tsv",
+        "per_query_excluded_ids.json": "analogues/math/queries%2Bqrels/per_query_excluded_ids.json",
+    },
+    "writing": {
+        "corpus.jsonl": "analogues/writing/corpus/corpus.jsonl",
+        "queries.jsonl": "analogues/writing/queries%2Bqrels/queries.jsonl",
+        "qrels.tsv": "analogues/writing/queries%2Bqrels/qrels.tsv",
+        "per_query_excluded_ids.json": "analogues/writing/queries%2Bqrels/per_query_excluded_ids.json",
+    },
 }
 
 
@@ -31,10 +39,15 @@ def download(url: str, target: pathlib.Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default=".benchmarks/obliq/data")
+    parser.add_argument("--subsets", default="math,writing")
     args = parser.parse_args()
-    out = pathlib.Path(args.data_dir) / "math"
-    for name, remote in FILES.items():
-        download(f"{BASE}/{remote}", out / name)
+    requested = [s.strip() for s in args.subsets.split(",") if s.strip()]
+    for subset in requested:
+        if subset not in FILES:
+            raise SystemExit(f"unknown subset `{subset}`; known: {', '.join(FILES)}")
+        out = pathlib.Path(args.data_dir) / subset
+        for name, remote in FILES[subset].items():
+            download(f"{BASE}/{remote}", out / name)
 
 
 if __name__ == "__main__":
