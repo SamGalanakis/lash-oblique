@@ -50,13 +50,16 @@ Named representative subsets:
 
 ## Tool Surface
 
-The RLM gets six tools:
+The RLM gets seven tools:
 
 - `search(queries, mode, limit, candidate_pool)` — corpus retrieval; `mode` is
   `"hybrid"` (default, BM25 + dense + optional late fused via RRF), `"bm25"`,
   `"dense"`, or `"late"`.
 - `discover_docs(target_query, context_pairs, limit)` — example-anchored search
   using positive/negative document pairs.
+- `judge_candidates(verifier_predicate, candidate_doc_ids, surface_bait)` —
+  calibrates retrieved ids into likely positives, distractors, and unclear cases,
+  then suggests surface bait to avoid and follow-up queries.
 - `tournament_rerank(query, candidate_pools, top_k)` — listwise tournament
   reranker; takes labeled candidate pools, does canonical RRF (k=60) across
   them, caps at 300, then runs the tournament.

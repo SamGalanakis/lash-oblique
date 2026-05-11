@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
-use crate::tournament::TournamentRerankProvider;
+use crate::tournament::{CandidateJudgeProvider, TournamentRerankProvider};
 
 const DEFAULT_DATA_DIR: &str = ".benchmarks/obliq/data";
 const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
@@ -1035,6 +1035,10 @@ fn build_core(
         obliq_tools.clone(),
         description.to_string(),
     ));
+    let candidate_judge: Arc<dyn ToolProvider> = Arc::new(CandidateJudgeProvider::new(
+        obliq_tools.clone(),
+        description.to_string(),
+    ));
 
     LashCore::builder()
         .install_mode(ModePreset::rlm())
@@ -1058,6 +1062,10 @@ fn build_core(
         .plugin(Arc::new(StaticPluginFactory::new(
             "obliq_tournament_rerank",
             PluginSpec::new().with_tool_provider(tournament),
+        )) as Arc<dyn PluginFactory>)
+        .plugin(Arc::new(StaticPluginFactory::new(
+            "obliq_candidate_judge",
+            PluginSpec::new().with_tool_provider(candidate_judge),
         )) as Arc<dyn PluginFactory>)
         .plugin(subagents as Arc<dyn PluginFactory>)
         .build()
@@ -1132,18 +1140,26 @@ text:
 # Corpus
 The searchable corpus has {corpus_docs} documents. Every submitted id must come from a tool result. Submit exactly 100 unique, non-excluded ids ranked best first.
 
+# Retrieval Vocabulary
+- Latent attribute: the abstract relation, strategy, or structure that makes a document relevant.
+- Verifier predicate: a short test a document must pass to count as relevant.
+- Surface bait: words, topics, or formats that look similar but do not prove the latent attribute.
+- Attribute carrier: a different surface domain likely to express the same latent attribute.
+- Calibration set: likely positives, distractors, and unclear docs found by retrieval.
+
 # Strategy
-1. State the hidden relevance schema in your own words: objects plus relations. Avoid the query's surface vocabulary.
-2. Run one broad hybrid `search` using 4–6 surface probes, `limit=300`, `candidate_pool=1500`.
-3. Read the top 8 returned texts inline. Classify each as schema match, surface-similar distractor, or unclear.
-4. If top results are mostly distractors, run one schema-anchored hybrid `search` with 4–6 probes from different surface domains. Avoid the distractor vocabulary.
-5. If you found at least one likely positive and one named distractor, run `discover_docs` with those positive/negative pairs.
+1. Write the verifier predicate in your own words. Avoid copying the query's surface vocabulary.
+2. Run one broad hybrid `search` using 4-6 probes: some surface probes plus some attribute-carrier probes. Use `limit=300`, `candidate_pool=1500`.
+3. Call `judge_candidates` on 30-50 top ids from that search. Use its positives, distractors, unclear ids, surface bait, refined predicate, and next queries as your calibration set.
+4. Run one schema-anchored hybrid `search` from the refined predicate and next queries. Search for attribute carriers; avoid known surface bait.
+5. If calibration found at least one likely positive and one named distractor, run `discover_docs` with those positive/negative pairs.
 6. Optional: add one single-channel diversity `search` if a distinct phrasing or channel is missing. {late_note}
 7. Build `candidate_pools` with one pool per retrieval call. Use each call's ids in order. Do not pre-merge or truncate pools.
-8. Call `tournament_rerank` once with `top_k=100`. Use its output as the submission order.
+8. Call `tournament_rerank` once with `top_k=100`, using the refined predicate as the query. Use its output as the submission order.
 
 # Hard rules
 - Every submitted id comes from a tool result.
+- Use `judge_candidates` before `discover_docs` or `tournament_rerank`.
 - Use `tournament_rerank`; do not hand-rank the final list.
 - Keep candidate pools separate; tournament handles RRF merge and the internal top-300 cap.
 - Submit exactly 100 unique, non-excluded ids. If `tournament_rerank` returns fewer than 100, fill the tail with the next-best candidates from your raw pools (in any reasonable order).

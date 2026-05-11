@@ -28,9 +28,162 @@ const KEEP_PER_BATCH: usize = 8;
 const RRF_K: f64 = 60.0;
 const DEFAULT_TOP_K: usize = 100;
 const MAX_DOC_CHARS: usize = 6000;
+const MAX_JUDGE_DOC_CHARS: usize = 2500;
+const MAX_JUDGE_CANDIDATES: usize = 50;
 const MAX_PARALLEL_BATCHES: usize = 8;
 const SHUFFLE_SEED: u64 = 0x0B11_9EBE_7C8B_AD00;
 const DIRECT_RERANK_VARIANT: &str = "low";
+
+pub struct CandidateJudgeProvider {
+    obliq: Arc<ObliqTools>,
+    description: String,
+}
+
+impl CandidateJudgeProvider {
+    pub fn new(obliq: Arc<ObliqTools>, description: String) -> Self {
+        Self { obliq, description }
+    }
+
+    pub fn tool_definition() -> ToolDefinition {
+        ToolDefinition::raw(
+            "judge_candidates",
+            "Calibrate retrieval against a verifier predicate. Provide retrieved document ids \
+             plus the latent pattern you are testing. Returns likely positives, \
+             surface-similar distractors, unclear cases, surface bait to avoid, a refined \
+             predicate, and follow-up queries for the next retrieval pass.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "verifier_predicate": { "type": "string", "minLength": 1 },
+                    "candidate_doc_ids": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 },
+                        "minItems": 1,
+                        "maxItems": MAX_JUDGE_CANDIDATES
+                    },
+                    "surface_bait": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 },
+                        "maxItems": 20,
+                        "default": []
+                    }
+                },
+                "required": ["verifier_predicate", "candidate_doc_ids"],
+                "additionalProperties": false
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "positive_ids": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 }
+                    },
+                    "distractor_ids": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 }
+                    },
+                    "unclear_ids": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 }
+                    },
+                    "surface_bait": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 }
+                    },
+                    "refined_predicate": { "type": "string" },
+                    "next_queries": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 }
+                    }
+                },
+                "required": [
+                    "positive_ids",
+                    "distractor_ids",
+                    "unclear_ids",
+                    "surface_bait",
+                    "refined_predicate",
+                    "next_queries"
+                ],
+                "additionalProperties": false
+            }),
+        )
+        .with_execution_mode(ToolExecutionMode::Parallel)
+    }
+
+    async fn judge(&self, args: &Value, context: &ToolContext) -> Result<Value, String> {
+        let verifier_predicate = args
+            .get("verifier_predicate")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "missing required parameter: verifier_predicate".to_string())?
+            .to_string();
+        let candidate_doc_ids = args
+            .get("candidate_doc_ids")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "missing required parameter: candidate_doc_ids".to_string())?;
+        let mut candidates = Vec::new();
+        let mut seen = BTreeSet::new();
+        for value in candidate_doc_ids {
+            let Some(id) = value.as_str().map(str::trim).filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            if seen.insert(id.to_string()) {
+                candidates.push(id.to_string());
+            }
+        }
+        if candidates.is_empty() {
+            return Err("judge_candidates needs at least one candidate id".to_string());
+        }
+        if candidates.len() > MAX_JUDGE_CANDIDATES {
+            candidates.truncate(MAX_JUDGE_CANDIDATES);
+        }
+
+        let surface_bait = string_array(args.get("surface_bait"), 20);
+        let docs = self
+            .obliq
+            .fetch_doc_texts(&candidates)
+            .await
+            .map_err(|err| format!("failed to fetch doc texts: {err}"))?;
+        let session_model = context
+            .session_model()
+            .await
+            .map_err(|err| format!("failed to read session model: {err}"))?;
+
+        let raw = judge_candidate_batch(
+            context.clone(),
+            &session_model.model,
+            Some(DIRECT_RERANK_VARIANT),
+            context.session_id(),
+            context.tool_call_id().map(str::to_string),
+            &self.description,
+            &verifier_predicate,
+            &surface_bait,
+            &docs,
+            &candidates,
+        )
+        .await?;
+
+        Ok(clean_judge_output(raw, &candidates, &verifier_predicate))
+    }
+}
+
+#[async_trait]
+impl ToolProvider for CandidateJudgeProvider {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![Self::tool_definition()]
+    }
+
+    async fn execute(&self, call: ToolCall<'_>) -> ToolResult {
+        match call.name {
+            "judge_candidates" => match self.judge(call.args, call.context).await {
+                Ok(value) => ToolResult::ok(value),
+                Err(err) => ToolResult::err(json!(err)),
+            },
+            other => ToolResult::err_fmt(format_args!("unknown tool: {other}")),
+        }
+    }
+}
 
 pub struct TournamentRerankProvider {
     obliq: Arc<ObliqTools>,
@@ -214,6 +367,207 @@ fn rrf_merge(pools: &[Value], top_n: usize) -> Vec<String> {
         .take(top_n)
         .map(|(id, _, _)| id)
         .collect()
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "candidate judging needs the session context plus immutable calibration inputs"
+)]
+async fn judge_candidate_batch(
+    context: ToolContext,
+    model: &str,
+    model_variant: Option<&str>,
+    session_id: &str,
+    originating_tool_call_id: Option<String>,
+    description: &str,
+    verifier_predicate: &str,
+    surface_bait: &[String],
+    docs: &HashMap<String, String>,
+    candidates: &[String],
+) -> Result<Value, String> {
+    let mut user = String::new();
+    user.push_str("Benchmark relevance description:\n");
+    user.push_str(description);
+    user.push_str("\n\nVerifier predicate:\n");
+    user.push_str(verifier_predicate);
+    if !surface_bait.is_empty() {
+        user.push_str("\n\nSurface bait already noticed:\n");
+        for bait in surface_bait {
+            user.push_str("- ");
+            user.push_str(bait);
+            user.push('\n');
+        }
+    }
+    user.push_str("\n\nDocuments to judge (doc_id followed by text):\n\n");
+    for id in candidates {
+        user.push_str("=== ");
+        user.push_str(id);
+        user.push_str(" ===\n");
+        let text = docs.get(id).map(String::as_str).unwrap_or("(missing)");
+        user.push_str(&truncate_for_prompt(text, MAX_JUDGE_DOC_CHARS));
+        user.push_str("\n\n");
+    }
+    user.push_str(
+        "Return JSON only. Classify supplied ids as positive_ids, distractor_ids, or \
+         unclear_ids. A positive satisfies the verifier predicate; a distractor shares \
+         misleading surface cues but not the latent pattern. Also return surface_bait \
+         terms or themes to avoid, a concise refined_predicate, and up to 8 next_queries \
+         that search for attribute carriers rather than repeating the query wording.",
+    );
+
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "positive_ids",
+            "distractor_ids",
+            "unclear_ids",
+            "surface_bait",
+            "refined_predicate",
+            "next_queries"
+        ],
+        "properties": {
+            "positive_ids": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "distractor_ids": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "unclear_ids": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "surface_bait": {
+                "type": "array",
+                "items": { "type": "string" },
+                "maxItems": 20
+            },
+            "refined_predicate": { "type": "string" },
+            "next_queries": {
+                "type": "array",
+                "items": { "type": "string" },
+                "maxItems": 8
+            }
+        }
+    });
+
+    let request = DirectRequest {
+        model: model.to_string(),
+        model_variant: model_variant.map(str::to_string),
+        messages: vec![
+            DirectMessage {
+                role: DirectRole::System,
+                parts: vec![DirectPart::Text(
+                    "You calibrate retrieval for an analogy benchmark. Judge whether each \
+                     document matches the latent predicate, not whether it reuses the query's \
+                     wording. Return JSON only."
+                        .to_string(),
+                )],
+            },
+            DirectMessage {
+                role: DirectRole::User,
+                parts: vec![DirectPart::Text(user)],
+            },
+        ],
+        attachments: Vec::new(),
+        output: DirectOutputSpec::JsonSchema(DirectJsonSchema {
+            name: "judge_candidates_batch".to_string(),
+            schema,
+            strict: true,
+        }),
+        stream_events: None,
+        session_id: Some(format!("{session_id}-judge")),
+        originating_tool_call_id,
+    };
+
+    let completion = context
+        .direct_completion(request, "judge_candidates")
+        .await
+        .map_err(|err| format!("direct_completion failed: {err}"))?;
+    let text = completion.text.trim();
+    serde_json::from_str(text)
+        .map_err(|err| format!("malformed JSON from candidate judge: {err}; raw=`{text}`"))
+}
+
+fn clean_judge_output(raw: Value, supplied_ids: &[String], fallback_predicate: &str) -> Value {
+    let supplied: BTreeSet<String> = supplied_ids.iter().cloned().collect();
+    let mut used = BTreeSet::new();
+    let positive_ids = clean_id_array(raw.get("positive_ids"), &supplied, &mut used);
+    let distractor_ids = clean_id_array(raw.get("distractor_ids"), &supplied, &mut used);
+    let mut unclear_ids = clean_id_array(raw.get("unclear_ids"), &supplied, &mut used);
+    for id in supplied_ids {
+        if used.insert(id.clone()) {
+            unclear_ids.push(id.clone());
+        }
+    }
+
+    let refined_predicate = raw
+        .get("refined_predicate")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_predicate)
+        .to_string();
+
+    json!({
+        "positive_ids": positive_ids,
+        "distractor_ids": distractor_ids,
+        "unclear_ids": unclear_ids,
+        "surface_bait": string_array(raw.get("surface_bait"), 20),
+        "refined_predicate": refined_predicate,
+        "next_queries": string_array(raw.get("next_queries"), 8)
+    })
+}
+
+fn clean_id_array(
+    value: Option<&Value>,
+    supplied: &BTreeSet<String>,
+    used: &mut BTreeSet<String>,
+) -> Vec<String> {
+    let Some(array) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in array {
+        let Some(id) = item.as_str().map(str::trim).filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        if supplied.contains(id) && used.insert(id.to_string()) {
+            out.push(id.to_string());
+        }
+    }
+    out
+}
+
+fn string_array(value: Option<&Value>, max_items: usize) -> Vec<String> {
+    let Some(array) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for item in array {
+        let Some(text) = item.as_str().map(str::trim).filter(|text| !text.is_empty()) else {
+            continue;
+        };
+        if seen.insert(text.to_string()) {
+            out.push(text.to_string());
+        }
+        if out.len() >= max_items {
+            break;
+        }
+    }
+    out
+}
+
+fn truncate_for_prompt(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars).collect();
+    truncated.push_str("\n[...truncated]");
+    truncated
 }
 
 #[expect(
