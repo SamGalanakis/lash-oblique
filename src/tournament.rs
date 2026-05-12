@@ -19,11 +19,12 @@ use crate::ObliqTools;
 const BATCH_SIZE: usize = 20;
 // Tournament's recall@top_k is structurally bounded by top_k / pool_size:
 // docs eliminated in round 1 land in the appended tail, past every doc that
-// survived to round 2+. Cap applies to the POST-RRF-MERGE pool — agent
-// passes any number of labeled pools, RRF picks the top 300 by canonical
-// fusion score (k=60), tournament runs on those. Keep=8 gives gold ~40%
-// per-round survival probability vs ~25% at keep=5.
-const MAX_TOURNAMENT_INPUT: usize = 300;
+// survived to round 2+. Preserve a recall reservoir before tournament:
+// canonical RRF top-300 plus each pool's top slice, deduped, capped at 600.
+// This keeps single-pool hard hits alive without letting every noisy tail in.
+const RRF_TOP_N: usize = 300;
+const PER_POOL_RESERVOIR: usize = 75;
+const MAX_TOURNAMENT_INPUT: usize = 600;
 const KEEP_PER_BATCH: usize = 8;
 const RRF_K: f64 = 60.0;
 const DEFAULT_TOP_K: usize = 100;
@@ -199,12 +200,15 @@ impl TournamentRerankProvider {
         ToolDefinition::raw(
             "tournament_rerank",
             "Listwise tournament reranker. Takes labeled candidate pools (one per channel \
-             or probe-set you ran), does canonical Reciprocal Rank Fusion (k=60) across \
-             them to produce the merged top-300, then runs the listwise tournament: \
+             or probe-set you ran). Each pool uses the same `matches` array returned by \
+             `search` and `discover_docs`. The reranker extracts `doc_id` in match order, \
+             builds a deduped recall reservoir from canonical Reciprocal Rank Fusion \
+             (k=60) plus each pool's top candidates, caps that reservoir at 600, then \
+             runs the listwise tournament: \
              shuffles into batches of 20, ranks each batch under the dataset's relevance \
              description, promotes the top 8 of each batch to the next round, and keeps \
              eliminated tails in elimination-depth order. Returns the merged ranking \
-             truncated to top_k. Pass each search result set as its own pool — the merge \
+             truncated to top_k. Pass each retrieval result set as its own pool — the merge \
              is deterministic and won't drop single-channel hits.",
             json!({
                 "type": "object",
@@ -216,13 +220,24 @@ impl TournamentRerankProvider {
                             "type": "object",
                             "properties": {
                                 "label": { "type": "string", "minLength": 1 },
-                                "ranked_doc_ids": {
+                                "matches": {
                                     "type": "array",
-                                    "items": { "type": "string", "minLength": 1 },
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "rank": { "type": "integer", "minimum": 1 },
+                                            "doc_id": { "type": "string", "minLength": 1 },
+                                            "score": { "type": "number" },
+                                            "text": { "type": "string" },
+                                            "metadata": { "type": "object", "additionalProperties": true }
+                                        },
+                                        "required": ["rank", "doc_id", "score", "text", "metadata"],
+                                        "additionalProperties": false
+                                    },
                                     "minItems": 1
                                 }
                             },
-                            "required": ["label", "ranked_doc_ids"],
+                            "required": ["label", "matches"],
                             "additionalProperties": false
                         },
                         "minItems": 1,
@@ -265,7 +280,8 @@ impl TournamentRerankProvider {
             .get("candidate_pools")
             .and_then(Value::as_array)
             .ok_or_else(|| "missing required parameter: candidate_pools".to_string())?;
-        let mut candidates = rrf_merge(pools, MAX_TOURNAMENT_INPUT);
+        let mut candidates =
+            recall_reservoir(pools, RRF_TOP_N, PER_POOL_RESERVOIR, MAX_TOURNAMENT_INPUT);
         if candidates.len() < 2 {
             return Err(format!(
                 "tournament_rerank needs >= 2 unique candidates across pools, got {}",
@@ -328,21 +344,47 @@ impl ToolProvider for TournamentRerankProvider {
     }
 }
 
+fn recall_reservoir(
+    pools: &[Value],
+    rrf_top_n: usize,
+    per_pool_top_n: usize,
+    max_candidates: usize,
+) -> Vec<String> {
+    let ranked = rrf_merge(pools, rrf_top_n);
+    let mut out =
+        Vec::with_capacity(max_candidates.min(ranked.len() + pools.len() * per_pool_top_n));
+    let mut seen = BTreeSet::new();
+    for id in ranked {
+        push_unique_candidate(&mut out, &mut seen, id, max_candidates);
+    }
+    for pool in pools {
+        for id in pool_doc_ids(pool).into_iter().take(per_pool_top_n) {
+            push_unique_candidate(&mut out, &mut seen, id, max_candidates);
+            if out.len() >= max_candidates {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+fn push_unique_candidate(
+    out: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    id: String,
+    max_candidates: usize,
+) {
+    if out.len() < max_candidates && seen.insert(id.clone()) {
+        out.push(id);
+    }
+}
+
 fn rrf_merge(pools: &[Value], top_n: usize) -> Vec<String> {
     let mut scores: HashMap<String, f64> = HashMap::new();
     let mut first_seen_order: Vec<String> = Vec::new();
     let mut first_seen: BTreeSet<String> = BTreeSet::new();
     for pool in pools {
-        let Some(ids) = pool.get("ranked_doc_ids").and_then(Value::as_array) else {
-            continue;
-        };
-        for (rank, value) in ids.iter().enumerate() {
-            let Some(text) = value.as_str() else { continue };
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let id = trimmed.to_string();
+        for (rank, id) in pool_doc_ids(pool).into_iter().enumerate() {
             *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + (rank + 1) as f64);
             if first_seen.insert(id.clone()) {
                 first_seen_order.push(id);
@@ -367,6 +409,23 @@ fn rrf_merge(pools: &[Value], top_n: usize) -> Vec<String> {
         .take(top_n)
         .map(|(id, _, _)| id)
         .collect()
+}
+
+fn pool_doc_ids(pool: &Value) -> Vec<String> {
+    let Some(matches) = pool.get("matches").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::with_capacity(matches.len());
+    let mut seen = BTreeSet::new();
+    for value in matches {
+        let Some(trimmed) = value.get("doc_id").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            ids.push(trimmed.to_string());
+        }
+    }
+    ids
 }
 
 #[expect(

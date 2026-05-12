@@ -191,17 +191,23 @@ class Searcher:
     ):
         if not context_pairs:
             raise RuntimeError("context_pairs must not be empty")
+        positive_texts = [pair["positive_text"] for pair in context_pairs]
+        negative_texts = [pair["negative_text"] for pair in context_pairs]
+        embeddings = self.dense_embed([target_query, *positive_texts, *negative_texts])
+        target = embeddings[0]
+        positives = embeddings[1 : 1 + len(context_pairs)]
+        negatives = embeddings[1 + len(context_pairs) :]
         result = self.client.query_points(
             collection_name=self.collection,
             query=models.DiscoverQuery(
                 discover=models.DiscoverInput(
-                    target=self.dense_embed([target_query])[0],
+                    target=target,
                     context=[
                         models.ContextPair(
-                            positive=point_id(self.subset, pair["positive_doc_id"]),
-                            negative=point_id(self.subset, pair["negative_doc_id"]),
+                            positive=positive,
+                            negative=negative,
                         )
-                        for pair in context_pairs
+                        for positive, negative in zip(positives, negatives, strict=True)
                     ],
                 )
             ),

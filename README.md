@@ -56,13 +56,15 @@ The RLM gets seven tools:
   `"hybrid"` (default, BM25 + dense + optional late fused via RRF), `"bm25"`,
   `"dense"`, or `"late"`.
 - `discover_docs(target_query, context_pairs, limit)` — example-anchored search
-  using positive/negative document pairs.
+  using `{ positive_text, negative_text }` pairs.
 - `judge_candidates(verifier_predicate, candidate_doc_ids, surface_bait)` —
   calibrates retrieved ids into likely positives, distractors, and unclear cases,
   then suggests surface bait to avoid and follow-up queries.
 - `tournament_rerank(query, candidate_pools, top_k)` — listwise tournament
-  reranker; takes labeled candidate pools, does canonical RRF (k=60) across
-  them, caps at 300, then runs the tournament.
+  reranker; takes labeled pools shaped as `{ label, matches }`, where `matches`
+  is the array returned by `search` or `discover_docs`, does canonical RRF
+  (k=60), preserves a deduped recall reservoir across pools, caps at 600, then
+  runs the tournament.
 - `llm_query`, `spawn_agent`, `list_async_handles` — RLM utilities.
 
 The Qdrant collection stores:
@@ -77,7 +79,7 @@ The setup script loads `OPENROUTER_API_KEY` from `/home/sam/code/lash/.env` by d
 
 All ranked retrieval tools return `{ "matches": [...] }` ordered best-first.
 Each match includes `rank`, `doc_id`, `score`, `text` (full text inline), and
-`metadata`. Search tools default to `limit: 100` and cap at 200. Hybrid mode
+`metadata`. Search tools default to `limit: 300` and cap at 300. Hybrid mode
 uses Qdrant server-side RRF fusion over BM25 and dense prefetches, plus late
 prefetches when the collection was built with `--enable-late`.
 

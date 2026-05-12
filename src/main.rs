@@ -1145,23 +1145,59 @@ The searchable corpus has {corpus_docs} documents. Every submitted id must come 
 - Verifier predicate: a short test a document must pass to count as relevant.
 - Surface bait: words, topics, or formats that look similar but do not prove the latent attribute.
 - Attribute carrier: a different surface domain likely to express the same latent attribute.
+- Hypothesis family: one independent interpretation of the latent attribute. A new query is not a new family if it only swaps synonyms inside the same interpretation.
 - Calibration set: likely positives, distractors, and unclear docs found by retrieval.
 
-# Strategy
-1. Write the verifier predicate in your own words. Avoid copying the query's surface vocabulary.
-2. Run one broad hybrid `search` using 4-6 probes: some surface probes plus some attribute-carrier probes. Use `limit=300`, `candidate_pool=1500`.
-3. Call `judge_candidates` on 30-50 top ids from that search. Use its positives, distractors, unclear ids, surface bait, refined predicate, and next queries as your calibration set.
-4. Run one schema-anchored hybrid `search` from the refined predicate and next queries. Search for attribute carriers; avoid known surface bait.
-5. If calibration found at least one likely positive and one named distractor, run `discover_docs` with those positive/negative pairs.
-6. Optional: add one single-channel diversity `search` if a distinct phrasing or channel is missing. {late_note}
-7. Build `candidate_pools` with one pool per retrieval call. Use each call's ids in order. Do not pre-merge or truncate pools.
-8. Call `tournament_rerank` once with `top_k=100`, using the refined predicate as the query. Use its output as the submission order.
+# Hypothesis Diversity
+Before retrieval, generate competing hypotheses at different abstraction levels. Keep them alive until calibration gives evidence. Do not let one plausible early interpretation collapse the search.
+
+Useful families are dataset-agnostic:
+- Surface family: terms and entities directly present in the query.
+- Mechanism family: the core move or operation with surface nouns removed.
+- Representation family: changing coordinates, encoding, normal form, canonical model, or alternate viewpoint.
+- Constraint-shape family: matching the pattern of assumptions, conclusion, or obstruction.
+- Invariant/classification family: identifying what is preserved, quotient out, grouped, counted, ranked, or classified.
+- Construction/failure family: building the object, reducing to an extremal case, finding a counterexample, or proving impossibility.
+
+High-signal examples:
+- If the query appears to be about object A and a special theorem about A, do not only search for A/theorem variants. Also search for the abstraction "replace the object by a canonical representation where the desired property becomes transparent."
+- If early positives all share the same topic words, treat them as unproven. Add a wave that removes those topic words and searches for the operation or invariant that made the proof work.
+
+# Retrieval Loop
+Work like a high-recall retrieval agent, not a linear search script. Keep a small state with:
+- the current verifier predicate,
+- retrieval hypotheses tried,
+- pools collected,
+- likely positives, distractors, unclear cases,
+- surface bait to avoid,
+- missing attribute-carrier domains.
+
+1. Write the verifier predicate. Then list 4-6 distinct hypothesis families before calling tools. Each family must name a different abstraction, not just different words for the same abstraction.
+2. Run those hypotheses as independent `search` calls with `limit=300`, keeping each result as a separate pool:
+   - near-surface hybrid probes from the query wording.
+   - mechanism hybrid probes that name the move without the query topic.
+   - representation/canonical-form probes that describe how the object is re-encoded or normalized.
+   - constraint-shape probes that match the assumption-to-conclusion structure.
+   - invariant/classification probes that search for the preserved quantity or equivalence relation.
+   - attribute-carrier hybrid probes from distant settings where the same latent attribute could appear.
+   - one dense conceptual search for paraphrases of the latent attribute.
+   - one BM25 lexical search for rare formal phrases or symbols, if useful.
+   - optional single-channel diversity search if a distinct phrasing or channel is missing. {late_note}
+3. Sample 30-50 unique calibration ids across all initial pools: top hits, mid-ranked outliers, and different surface domains. Call `judge_candidates`.
+4. Re-plan from the judge output. If positives exist, search around their abstract pattern without copying their topic. If positives all came from one hypothesis family, add another wave from different families before reranking. If no positives exist, do not narrow; add 2-3 new distant hypothesis families.
+5. If calibration found at least one likely positive and one distractor, run `discover_docs` with `context_pairs: [{{ positive_text, negative_text }}]` using text copied from retrieval matches.
+6. Stop retrieving only after you have either found plausible positives across more than one pool or exhausted at least two distinct waves of hypotheses. Then build `candidate_pools` as `{{ label: "...", matches: result.matches }}` for every retrieval call.
+7. Call `tournament_rerank` once with `top_k=100`, using the refined predicate as the query. Use its output as the submission order.
 
 # Hard rules
 - Every submitted id comes from a tool result.
+- Do not rely on one initial search. High recall comes from multiple independent retrieval hypotheses.
+- Do not rerank immediately after a failed calibration. Widen first.
 - Use `judge_candidates` before `discover_docs` or `tournament_rerank`.
+- Lashlang has no `while` loop. Use bounded `for` loops over lists or `range(...)`.
 - Use `tournament_rerank`; do not hand-rank the final list.
-- Keep candidate pools separate; tournament handles RRF merge and the internal top-300 cap.
+- Keep candidate pools separate; tournament dedupes and preserves a recall reservoir across pools.
+- `discover_docs` context pairs use document text, not document ids.
 - Submit exactly 100 unique, non-excluded ids. If `tournament_rerank` returns fewer than 100, fill the tail with the next-best candidates from your raw pools (in any reasonable order).
 
 # Submission
@@ -1288,7 +1324,7 @@ impl ToolProvider for ObliqTools {
             ),
             obliq_tool(
                 "discover_docs",
-                "Example-guided discovery: provide a target query plus positive-vs-negative document pairs to bias retrieval toward the latent pattern you want and away from surface-similar distractors. Returns `{ matches: [...] }` ordered best-first; each match has `rank`, `doc_id`, `score`, `text`, and `metadata`.",
+                "Example-guided discovery. Provide a target query plus example-text pairs shaped as `{ positive_text, negative_text }`. The positive text should show the latent pattern you want; the negative text should be a surface-similar distractor. Returns `{ matches: [...] }` ordered best-first; each match has `rank`, `doc_id`, `score`, `text`, and `metadata`.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -1298,10 +1334,10 @@ impl ToolProvider for ObliqTools {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "positive_doc_id": { "type": "string", "minLength": 1 },
-                                    "negative_doc_id": { "type": "string", "minLength": 1 }
+                                    "positive_text": { "type": "string", "minLength": 1 },
+                                    "negative_text": { "type": "string", "minLength": 1 }
                                 },
-                                "required": ["positive_doc_id", "negative_doc_id"],
+                                "required": ["positive_text", "negative_text"],
                                 "additionalProperties": false
                             },
                             "minItems": 1,
