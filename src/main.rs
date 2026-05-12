@@ -1163,6 +1163,38 @@ High-signal examples:
 - If the query appears to be about object A and a special theorem about A, do not only search for A/theorem variants. Also search for the abstraction "replace the object by a canonical representation where the desired property becomes transparent."
 - If early positives all share the same topic words, treat them as unproven. Add a wave that removes those topic words and searches for the operation or invariant that made the proof work.
 
+# Inspecting Results
+Search results are already cached in your variables. Do not print whole result objects or whole match lists. Inspect ranked lists by printing small pages or sampled projections.
+
+Useful Lashlang patterns:
+```lashlang
+preview = []
+for m in slice(pool.matches, 0, 8) {{
+  preview = push(preview, {{ rank: m.rank, doc_id: m.doc_id, score: m.score, text: slice(m.text, 0, 260) }})
+}}
+print {{ pool: "mechanism", preview: preview }}
+```
+
+```lashlang
+sample = []
+for i in [0, 1, 2, 4, 9, 19, 49, 99, 149, 199, 249] {{
+  if i < len(pool.matches) {{
+    m = pool.matches[i]
+    sample = push(sample, {{ rank: m.rank, doc_id: m.doc_id, text: slice(m.text, 0, 220) }})
+  }}
+}}
+print {{ pool: "representation", sample: sample }}
+```
+
+Browse the ranking you already retrieved before repeatedly rewriting the query. If a promising document appears at rank 50, 150, or 250, inspect its text slice and include its id in calibration instead of abandoning the pool.
+
+# Delegation
+Use helpers to improve judgment, not to replace your retrieval state.
+- Use `llm_query` for bounded classification over data already in variables: refine the verifier predicate, compare a small set of snippets, or extract why positives and distractors differ.
+- Use subagents only for independent hypothesis families that can search in parallel. Give each subagent one family, the verifier predicate, and the non-excluded-id rule. Ask for `{{ label, searched_queries, candidate_doc_ids, rationale }}`, not a final answer.
+- Merge helper outputs back into your own pools and calibration set. Do not trust a helper's conclusion unless its candidate ids came from tool results and its rationale matches the verifier predicate.
+- Keep helper tasks reversible: if a helper's candidates all share surface bait or fail calibration, mark that family weak and return to other families.
+
 # Retrieval Loop
 Work like a high-recall retrieval agent, not a linear search script. Keep a small state with:
 - the current verifier predicate,
@@ -1183,8 +1215,8 @@ Work like a high-recall retrieval agent, not a linear search script. Keep a smal
    - one dense conceptual search for paraphrases of the latent attribute.
    - one BM25 lexical search for rare formal phrases or symbols, if useful.
    - optional single-channel diversity search if a distinct phrasing or channel is missing. {late_note}
-3. Sample 30-50 unique calibration ids across all initial pools: top hits, mid-ranked outliers, and different surface domains. Call `judge_candidates`.
-4. Re-plan from the judge output. If positives exist, search around their abstract pattern without copying their topic. If positives all came from one hypothesis family, add another wave from different families before reranking. If no positives exist, do not narrow; add 2-3 new distant hypothesis families.
+3. Inspect each initial pool with small printed previews/samples only. Then sample 30-50 unique calibration ids across all initial pools: top hits, mid-ranked outliers, and different surface domains. Call `judge_candidates`.
+4. Re-plan from the judge output. If positives exist, search around their abstract pattern without copying their topic. If positives all came from one hypothesis family, add another wave from different families before reranking. If no positives exist, do not narrow; add 2-3 new distant hypothesis families. Use `llm_query` or subagents here when they can test independent alternatives in parallel.
 5. If calibration found at least one likely positive and one distractor, run `discover_docs` with `context_pairs: [{{ positive_text, negative_text }}]` using text copied from retrieval matches.
 6. Stop retrieving only after you have either found plausible positives across more than one pool or exhausted at least two distinct waves of hypotheses. Then build `candidate_pools` as `{{ label: "...", matches: result.matches }}` for every retrieval call.
 7. Call `tournament_rerank` once with `top_k=100`, using the refined predicate as the query. Use its output as the submission order.
@@ -1192,8 +1224,10 @@ Work like a high-recall retrieval agent, not a linear search script. Keep a smal
 # Hard rules
 - Every submitted id comes from a tool result.
 - Do not rely on one initial search. High recall comes from multiple independent retrieval hypotheses.
+- Do not print whole documents, whole result objects, or whole match lists. Use `slice(...)` and projected records with rank, doc_id, score, and short text snippets.
 - Do not rerank immediately after a failed calibration. Widen first.
 - Use `judge_candidates` before `discover_docs` or `tournament_rerank`.
+- Use `llm_query` for small, explicit judgments over snippets; use subagents for independent hypothesis-family searches when helpful.
 - Lashlang has no `while` loop. Use bounded `for` loops over lists or `range(...)`.
 - Use `tournament_rerank`; do not hand-rank the final list.
 - Keep candidate pools separate; tournament dedupes and preserves a recall reservoir across pools.
